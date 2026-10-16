@@ -3014,7 +3014,7 @@ function settleEvidenceResolutionPlainFs(targetRoot: string, initial: UnboundPro
   if (holder !== null && resolution.stagingPath !== null && resolution.stagingIdentity !== null) {
     const staging = at(resolution.stagingPath);
     if (fallbackPathPresent(staging) && fallbackProjectionIdentity(staging) === resolution.stagingIdentity) {
-      rmSync(staging, { recursive: true });
+      rmSync(staging, { recursive: true, force: true });
     }
   }
   resolution.stagingIdentity = null;
