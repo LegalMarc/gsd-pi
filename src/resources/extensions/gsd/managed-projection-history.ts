@@ -9,6 +9,7 @@ import {
   realpathSync,
   renameSync,
   rmdirSync,
+  rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -2151,10 +2152,11 @@ export function scanProjectionRootStructure(targetRoot: string): ProjectionRootS
 }
 
 // Lock-free evidence listing: the plain-fs reader, with no journal replay and
-// no native-control descriptors merged in. It is the degraded read when the
-// native lock is unavailable, and the doctor's read on a store whose
-// projection root the lock structurally rejects (#2648) — there every native
-// open throws, and the retained evidence must stay enumerable.
+// no native-control descriptors merged in. It is the read-only listing the
+// doctor uses on a store whose projection root the lock structurally rejects
+// (#2648) — there every native open throws, and the retained evidence must
+// stay enumerable. The degraded read (native lock unavailable) is this reader
+// after the plain-fs replay of in-flight resolutions (#2819).
 export function loadUnboundProjectionEvidenceLockFree(targetRoot: string): UnboundProjectionEvidence[] {
   return withProjectionMutationSync(
     historyPath(targetRoot),
@@ -2163,7 +2165,12 @@ export function loadUnboundProjectionEvidenceLockFree(targetRoot: string): Unbou
 }
 
 export function loadUnboundProjectionEvidence(targetRoot: string): UnboundProjectionEvidence[] {
-  if (!isProjectionRootIdentityLockAvailable()) return loadUnboundProjectionEvidenceLockFree(targetRoot);
+  if (!isProjectionRootIdentityLockAvailable()) {
+    return withProjectionMutationSync(historyPath(targetRoot), () => {
+      recoverEvidenceResolutionsPlainFs(targetRoot);
+      return readFallbackUnboundProjectionEvidence(targetRoot);
+    });
+  }
   const path = historyPath(targetRoot);
   return withProjectionMutationSync(path, () => withManagedProjectionRoot(targetRoot, (handle) => {
     recoverManagedProjectionMutations(targetRoot, handle);
@@ -2736,7 +2743,10 @@ export function previewUnboundProjectionEvidenceResolution(
   action: UnboundProjectionEvidenceResolutionAction = "discard",
 ): UnboundProjectionEvidenceResolutionPreview {
   if (!isProjectionRootIdentityLockAvailable()) {
-    return previewUnboundProjectionEvidenceResolutionLockFree(targetRoot, evidenceId, action);
+    return withProjectionMutationSync(historyPath(targetRoot), () => {
+      recoverEvidenceResolutionsPlainFs(targetRoot);
+      return previewUnboundProjectionEvidenceResolutionLockFree(targetRoot, evidenceId, action);
+    });
   }
   return withProjectionMutationSync(historyPath(targetRoot), () => withManagedProjectionRoot(targetRoot, handle => {
     recoverManagedProjectionMutations(targetRoot, handle);
@@ -2832,6 +2842,296 @@ function publishVerifiedPlainFsCopy(
   }
 }
 
+// Degraded replay of in-flight resolutions (#2819). The native lane replays
+// every resolving record on each open (recoverEvidenceResolutions); without
+// this counterpart, a resolution the native lane started and could not
+// finish — on a Windows host whose native ops fail again after every latch
+// cool-off (#2355) — could only ever be finished by the lane that keeps
+// failing. The replay works from what is on disk, not from the journal
+// alone: the reviewed bytes are located by their digest (identities only
+// decide whether a slot occupant is a protocol placeholder), bytes that are
+// neither the reviewed content nor provably ours are never deleted but kept
+// as their own record (as the native restage does), and every state it
+// persists is one the native replay also finishes, so either lane completes
+// what the other started.
+
+function fallbackPathPresent(path: string): boolean {
+  return lstatSync(path, { throwIfNoEntry: false }) !== undefined;
+}
+
+// Digest of a slot that may hold the reviewed bytes. A node of the other kind
+// cannot hold them, so it reads as "not the reviewed content", not an error.
+function fallbackSlotDigest(path: string, scope: "file" | "tree"): string | null {
+  const stat = lstatSync(path, { throwIfNoEntry: false });
+  if (stat === undefined || (scope === "file" ? !stat.isFile() : !stat.isDirectory())) return null;
+  return fallbackProjectionContentDigest(path, scope);
+}
+
+function fallbackSlotIsEmpty(path: string, scope: "file" | "tree"): boolean {
+  const stat = lstatSync(path);
+  return scope === "file"
+    ? stat.isFile() && stat.size === 0
+    : stat.isDirectory() && readdirSync(path).length === 0;
+}
+
+// The persisted resolution with the defaults and constraints the native
+// parser applies, so this replay accepts and writes exactly the rows it does.
+function fallbackEvidenceResolution(evidence: UnboundProjectionEvidence): UnboundProjectionEvidenceResolution {
+  const raw = evidence.resolution as unknown as Record<string, unknown> | undefined;
+  const action = raw?.action;
+  if (raw === undefined || (action !== "discard" && action !== "preserve" && action !== "restore")) {
+    throw new Error("unbound projection evidence is invalid");
+  }
+  const destinationPath = evidenceDestination(evidence, action);
+  const defaults = evidenceResolutionPaths(evidence.evidenceId, evidence.evidencePath, destinationPath);
+  const resolution = {
+    ...raw,
+    action,
+    destinationPath,
+    guardPath: raw.guardPath ?? defaults.guardPath,
+    guardIdentity: raw.guardIdentity ?? null,
+    stagingPath: raw.stagingPath ?? defaults.stagingPath,
+    stagingIdentity: raw.stagingIdentity ?? null,
+    exchangePath: raw.exchangePath ?? defaults.exchangePath,
+    exchangeIdentity: raw.exchangeIdentity ?? null,
+    phase: raw.phase ?? "prepared",
+  };
+  const identityOrNull = (value: unknown): boolean => value === null || typeof value === "string";
+  if ((raw.destinationPath !== undefined && raw.destinationPath !== destinationPath)
+    || typeof raw.currentIdentity !== "string"
+    || raw.contentDigest !== evidence.contentDigest
+    || typeof resolution.guardPath !== "string"
+    || !isEvidenceResolutionGuardPath(resolution.guardPath, defaults.guardPath)
+    || typeof resolution.exchangePath !== "string"
+    || !isEvidenceResolutionExchangePath(resolution.exchangePath, defaults.exchangePath)
+    || resolution.stagingPath !== defaults.stagingPath
+    || !identityOrNull(resolution.guardIdentity)
+    || !identityOrNull(resolution.exchangeIdentity)
+    || !identityOrNull(resolution.stagingIdentity)
+    || (resolution.phase !== "prepared" && resolution.phase !== "guarded"
+      && resolution.phase !== "published" && resolution.phase !== "deleting")) {
+    throw new Error("unbound projection evidence is invalid");
+  }
+  return resolution as unknown as UnboundProjectionEvidenceResolution;
+}
+
+// Finishes one resolving record without the native lock. Returns true when
+// the persisted resolution completed (the record is gone), false when the
+// record went back to review as plain retained evidence.
+function settleEvidenceResolutionPlainFs(targetRoot: string, initial: UnboundProjectionEvidence): boolean {
+  const resolution: UnboundProjectionEvidenceResolution = { ...fallbackEvidenceResolution(initial) };
+  const evidence: UnboundProjectionEvidence = { ...initial, resolution };
+  const { scope, logicalPath } = evidence;
+  const reviewed = resolution.contentDigest;
+  const destination = resolution.destinationPath;
+  const at = (logical: string): string => fallbackProjectionPath(targetRoot, logical);
+  const holds = (logical: string): boolean => fallbackSlotDigest(at(logical), scope) === reviewed;
+  const parent = dirname(evidence.evidencePath).replaceAll("\\", "/");
+  const prefix = parent === "." ? "" : `${parent}/`;
+
+  // Occupants this replay may not delete, kept as their own records.
+  const kept: UnboundProjectionEvidence[] = [];
+  const keep = (logical: string): void => {
+    const path = at(logical);
+    kept.push({
+      evidenceId: evidenceId(logical, "quarantine", logicalPath, scope),
+      evidencePath: logical,
+      evidenceIdentity: fallbackProjectionIdentity(path),
+      contentDigest: fallbackProjectionContentDigest(path, scope),
+      kind: "quarantine",
+      logicalPath,
+      scope,
+      transition: "retained",
+    });
+  };
+  // Replaces this record in the index (re-read, so other records stay as
+  // they are) and adds every kept occupant.
+  const persist = (replacement: readonly UnboundProjectionEvidence[]): void => {
+    const rows = new Map<string, UnboundProjectionEvidence>();
+    for (const entry of readFallbackUnboundProjectionEvidence(targetRoot)) {
+      if (entry.evidenceId !== evidence.evidenceId) {
+        rows.set(entry.evidenceId, entry);
+        continue;
+      }
+      for (const row of replacement) rows.set(row.evidenceId, row);
+    }
+    for (const row of kept) if (!rows.has(row.evidenceId)) rows.set(row.evidenceId, row);
+    writeFallbackUnboundProjectionEvidence(targetRoot, [...rows.values()]);
+  };
+
+  // Where are the reviewed bytes? While prepared, the evidence path first,
+  // then the guard slot an interrupted exchange or copy fallback moved them
+  // to. Once guarded, the protocol holds them in the guard, so a canonical
+  // path re-rendered with identical bytes is never mistaken for them. The
+  // exchange slot last: it only matches when every slot holds the same
+  // (empty) bytes.
+  const exchangePath = resolution.exchangePath!;
+  const slots = resolution.phase === "prepared"
+    ? [evidence.evidencePath, resolution.guardPath, exchangePath]
+    : [resolution.guardPath, evidence.evidencePath, exchangePath];
+  const holder = slots.find((logical) => holds(logical)) ?? null;
+
+  // Every other slot is either provably ours — an empty placeholder with a
+  // journaled identity, or (file scope) a byte-identical copy while the
+  // reviewed bytes are held elsewhere — and removed, or kept for review with
+  // the record's slot re-pointed so no later replay trips over it.
+  const journaled = new Set(
+    [resolution.guardIdentity, resolution.exchangeIdentity, resolution.stagingIdentity]
+      .filter((identity): identity is string => identity !== null),
+  );
+  const provablyOurs = (logical: string): boolean => {
+    const path = at(logical);
+    if (journaled.has(fallbackProjectionIdentity(path)) && fallbackSlotIsEmpty(path, scope)) return true;
+    return holder !== null && scope === "file" && holds(logical);
+  };
+  const removals: string[] = [];
+  if (resolution.guardPath !== holder && fallbackPathPresent(at(resolution.guardPath))) {
+    if (provablyOurs(resolution.guardPath)) removals.push(resolution.guardPath);
+    else {
+      keep(resolution.guardPath);
+      resolution.guardPath = `${prefix}.gsd-projection-remove-${randomUUID()}`;
+      resolution.guardIdentity = null;
+    }
+  }
+  if (exchangePath !== holder && fallbackPathPresent(at(exchangePath))) {
+    if (provablyOurs(exchangePath)) removals.push(exchangePath);
+    else {
+      keep(exchangePath);
+      resolution.exchangePath = `${prefix}.gsd-projection-exchange-${randomUUID()}`;
+      resolution.exchangeIdentity = null;
+    }
+  }
+  // The guard placeholder an exchange left at the evidence path.
+  if (holder !== null && holder !== evidence.evidencePath
+    && fallbackPathPresent(at(evidence.evidencePath))
+    && journaled.has(fallbackProjectionIdentity(at(evidence.evidencePath)))
+    && fallbackSlotIsEmpty(at(evidence.evidencePath), scope)) {
+    removals.push(evidence.evidencePath);
+  }
+  // A tree publication's staging copy is ours by its journaled identity
+  // (possibly partial); it goes only while the reviewed bytes are held
+  // elsewhere. An unknown occupant of the staging path is left untouched.
+  if (holder !== null && resolution.stagingPath !== null && resolution.stagingIdentity !== null) {
+    const staging = at(resolution.stagingPath);
+    if (fallbackPathPresent(staging) && fallbackProjectionIdentity(staging) === resolution.stagingIdentity) {
+      rmSync(staging, { recursive: true });
+    }
+  }
+  resolution.stagingIdentity = null;
+  // Kept occupants are recorded before anything is removed.
+  if (kept.length > 0) persist([evidence]);
+  for (const logical of removals) {
+    const path = at(logical);
+    if (lstatSync(path).isDirectory()) rmdirSync(path);
+    else unlinkSync(path);
+  }
+
+  const returnToReview = (source: string | null): false => {
+    const path = at(evidence.evidencePath);
+    if (source !== null && source !== evidence.evidencePath) {
+      // Back to the evidence path when it is free (a rename keeps the file,
+      // so an earlier review of it still matches); otherwise the bytes stay
+      // where they are as their own record.
+      if (!fallbackPathPresent(path)) renameSync(at(source), path);
+      else keep(source);
+    }
+    // The record is re-reviewed against what its path holds now; with
+    // nothing there (or a node of the other kind) there is nothing to review.
+    const contentDigest = fallbackSlotDigest(path, scope);
+    persist(contentDigest === null ? [] : [{
+      evidenceId: evidence.evidenceId,
+      evidencePath: evidence.evidencePath,
+      evidenceIdentity: fallbackProjectionIdentity(path),
+      contentDigest,
+      kind: evidence.kind,
+      logicalPath,
+      scope,
+      transition: "retained",
+    }]);
+    return false;
+  };
+
+  if (holder === null) {
+    // Only the record is left of a resolution that already published (or
+    // needed no destination) and removed its source.
+    if ((resolution.phase === "published" || resolution.phase === "deleting")
+      && (destination === null || holds(destination))) {
+      persist([]);
+      return true;
+    }
+    return returnToReview(null);
+  }
+  // Plain fs finishes file scope and an empty-tree discard; anything else
+  // (tree publication, non-empty tree removal) has no guarded plain-fs form.
+  if (scope !== "file" && (resolution.action !== "discard" || !fallbackSlotIsEmpty(at(holder), scope))) {
+    return returnToReview(holder);
+  }
+  let source = holder;
+  if (source === exchangePath) {
+    renameSync(at(source), at(resolution.guardPath));
+    source = resolution.guardPath;
+  }
+  if (destination !== null && destination !== source) {
+    try {
+      publishVerifiedPlainFsCopy(at(source), at(destination), reviewed);
+    } catch (error) {
+      if (!(error instanceof Error)
+        || error.message !== "unbound projection evidence destination already contains different content") {
+        throw error;
+      }
+      return returnToReview(source);
+    }
+  }
+  // Persist the deletion phase before removing anything: either lane
+  // finishes a crash here (bytes in the guard: the guarded deletion; bytes
+  // at the evidence path with no guard: the plain-fs deleting marker).
+  const guardHolds = source === resolution.guardPath;
+  const guardIdentity = guardHolds ? fallbackProjectionIdentity(at(source)) : null;
+  persist([{
+    ...evidence,
+    evidenceIdentity: resolution.currentIdentity,
+    contentDigest: reviewed,
+    transition: "resolving",
+    resolution: {
+      ...resolution,
+      guardIdentity,
+      exchangeIdentity: null,
+      ...(guardHolds && guardIdentity !== resolution.currentIdentity ? { resolvedViaCopyFallback: true } : {}),
+      phase: "deleting",
+    },
+  }]);
+  // A canonical restore's destination is the evidence path itself: those
+  // reviewed bytes stay.
+  if (destination !== source) {
+    if (!holds(source)) throw new Error("unbound projection evidence changed after review");
+    const path = at(source);
+    if (scope === "file") unlinkSync(path);
+    else rmdirSync(path);
+  }
+  persist([]);
+  return true;
+}
+
+// Settles every resolving record. Returns the persisted action of each one it
+// completed, keyed by evidence ID and path (the two lookups findEvidence
+// accepts).
+function recoverEvidenceResolutionsPlainFs(
+  targetRoot: string,
+): ReadonlyMap<string, UnboundProjectionEvidenceResolutionAction> {
+  const completed = new Map<string, UnboundProjectionEvidenceResolutionAction>();
+  for (const { evidenceId: id } of readFallbackUnboundProjectionEvidence(targetRoot)) {
+    // Re-read: settling one record can rewrite the rows after it.
+    const evidence = readFallbackUnboundProjectionEvidence(targetRoot).find((entry) => entry.evidenceId === id);
+    if (evidence?.transition !== "resolving") continue;
+    const action = fallbackEvidenceResolution(evidence).action;
+    if (settleEvidenceResolutionPlainFs(targetRoot, evidence)) {
+      completed.set(evidence.evidenceId, action);
+      completed.set(evidence.evidencePath, action);
+    }
+  }
+  return completed;
+}
+
 // Latch-degraded / addon-absent resolution (#2815): the native resolution
 // protocol is reproduced with plain fs primitives and the same review contract.
 // The consent pins the reviewed identity and content digest, the reviewed bytes
@@ -2851,65 +3151,23 @@ function resolveUnboundProjectionEvidencePlainFs(
   consent: string,
 ): void {
   withProjectionMutationSync(historyPath(targetRoot), () => {
+    // In-flight resolutions — including ones the native lane started and
+    // could not finish — are replayed first, exactly as the native resolve
+    // does, so no record reaches the review below mid-protocol (#2819).
+    const completed = recoverEvidenceResolutionsPlainFs(targetRoot);
     const entries = readFallbackUnboundProjectionEvidence(targetRoot);
     const evidence = findEvidence(entries, evidenceId);
-    if (!evidence) throw new Error("unbound projection evidence is unavailable");
+    if (!evidence) {
+      // The replay just finished this record's persisted resolution, which
+      // the operator already consented to: re-issuing that same command is
+      // satisfied, a different action is not silently reported as done.
+      const finished = completed.get(evidenceId);
+      if (finished === action) return;
+      throw new Error(finished === undefined
+        ? "unbound projection evidence is unavailable"
+        : `unbound projection evidence was already resolved by its interrupted ${finished} resolution`);
+    }
     const path = fallbackProjectionPath(targetRoot, evidence.evidencePath);
-    // A record whose deletion phase was already persisted replays to
-    // completion exactly as the native replay does: the persisted resolution
-    // is the standing consent. A live guard artifact means the native
-    // protocol, not plain fs, holds the content — that state needs the lock.
-    // The published destination (when the action has one) must hold the
-    // reviewed bytes, and the source is only removed when it is still exactly
-    // the reviewed evidence; a canonical restore (destination === evidence
-    // path) keeps the reviewed bytes in place instead of removing them.
-    if (evidence.resolution?.phase === "deleting") {
-      if (existsSync(fallbackProjectionPath(targetRoot, evidence.resolution.guardPath))) {
-        throw new Error("native projection root identity locking is required to finish this in-flight evidence resolution");
-      }
-      if (evidence.resolution.destinationPath !== null) {
-        const destination = fallbackProjectionPath(targetRoot, evidence.resolution.destinationPath);
-        if (!existsSync(destination)
-          || fallbackProjectionContentDigest(destination, "file") !== evidence.resolution.contentDigest) {
-          throw new Error("unbound projection evidence completed destination changed");
-        }
-      }
-      if (existsSync(path) && evidence.resolution.destinationPath !== evidence.evidencePath) {
-        if (fallbackProjectionIdentity(path) !== evidence.resolution.currentIdentity
-          || fallbackProjectionContentDigest(path, evidence.scope) !== evidence.resolution.contentDigest) {
-          throw new Error("unbound projection evidence changed after review");
-        }
-        if (evidence.scope === "file") unlinkSync(path);
-        else rmdirSync(path);
-      }
-      writeFallbackUnboundProjectionEvidence(
-        targetRoot,
-        entries.filter((entry) => entry.evidenceId !== evidence.evidenceId),
-      );
-      return;
-    }
-    // A record mid-native-protocol (a crashed resolution) may hold its content
-    // in a guard/exchange artifact rather than at the evidence path (the
-    // exchange window): resolving against the evidence path there would review
-    // a placeholder while the real bytes go untracked. Native replay
-    // normalizes those records; degraded resolution is only safe once every
-    // prepared artifact is absent and the evidence file is the content holder.
-    if (evidence.resolution !== undefined) {
-      const prepared = evidence.resolution;
-      const artifactPresent = (identity: string | null, artifactPath: string | null): boolean =>
-        identity !== null && artifactPath !== null && existsSync(artifactPath);
-      const inFlight = prepared.phase !== "prepared"
-        || artifactPresent(prepared.guardIdentity, fallbackProjectionPath(targetRoot, prepared.guardPath))
-        || artifactPresent(
-          prepared.exchangeIdentity,
-          prepared.exchangePath === null
-            ? null
-            : fallbackProjectionPath(targetRoot, resolveEvidenceResolutionPaths(evidence).exchangePath),
-        );
-      if (inFlight) {
-        throw new Error("native projection root identity locking is required to finish this in-flight evidence resolution");
-      }
-    }
     if (!existsSync(path)) throw new Error("unbound projection evidence is unavailable");
     const currentIdentity = fallbackProjectionIdentity(path);
     const contentDigest = fallbackProjectionContentDigest(path, evidence.scope);

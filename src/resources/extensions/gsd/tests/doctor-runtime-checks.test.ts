@@ -261,7 +261,40 @@ test("doctor surfaces unresolved projection evidence with recovery instructions"
   assert.match(issue.message, /evidence:sha256:[0-9a-f]+ --action=discard --consent=discard:sha256:/u);
   assert.match(issue.message, /--action=preserve/u);
   assert.match(issue.message, /--action=restore/u);
+  assert.match(issue.message, /--consent=discard:sha256:[0-9a-f]{64} deletes \.gsd\/notes\/my notes\/\.gsd-projection-remove-/u);
+  assert.doesNotMatch(issue.message, /the projection itself/u);
   assert.equal(issue.fixable, false);
+});
+
+test("doctor says that discarding canonical evidence deletes the projection itself (#2819)", async (t) => {
+  const dir = createGitProject();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  // Canonical evidence is the projection file: discard removes it, which the
+  // printed command must say so an operator does not lose a merely stale
+  // projection by picking the first option.
+  mkdirSync(join(dir, ".gsd", "notes"), { recursive: true });
+  mkdirSync(join(dir, ".gsd", "migration"), { recursive: true });
+  writeFileSync(join(dir, ".gsd", "notes", "result.md"), "stale ledger\n");
+  writeFileSync(
+    join(dir, ".gsd", "migration", "unbound-projection-evidence.json"),
+    `${JSON.stringify([{
+      evidencePath: "notes/result.md",
+      evidenceIdentity: null,
+      kind: "canonical",
+      logicalPath: "notes/result.md",
+      scope: "file",
+      transition: "retained",
+    }])}\n`,
+  );
+
+  const report = await runGSDDoctor(dir);
+  const issue = report.issues.find(candidate => candidate.code === "unresolved_projection_evidence");
+  assert.ok(issue);
+  assert.match(
+    issue.message,
+    /--action=discard --consent=discard:sha256:[0-9a-f]{64} deletes \.gsd\/notes\/result\.md \(the projection itself; --action=restore keeps it in place\)/u,
+  );
 });
 
 test("doctor fix preserves a pending gate block in the hook state (#2194)", async (t) => {
@@ -458,9 +491,15 @@ test("doctor keeps listing resolvable evidence beside a record that cannot be re
   const healthyId = `evidence:sha256:${createHash("sha256")
     .update(JSON.stringify({ evidencePath: healthy, kind: "quarantine", logicalPath: "notes/result.md", scope: "file" }))
     .digest("hex")}`;
-  // This record's evidence file is gone (a crash mid-resolution): its preview
-  // throws and must not blank the assessment of the other records.
+  // This record's evidence file is gone: its preview throws and must not
+  // blank the assessment of the other records. (A resolving record in the
+  // same state is no longer unreviewable: the degraded read replays it, and
+  // with its bytes nowhere there is nothing left to review (#2819).)
   const missing = "notes/.gsd-projection-remove-00000000-0000-0000-0000-000000000002";
+  const settled = "notes/.gsd-projection-remove-00000000-0000-0000-0000-000000000003";
+  const settledId = `evidence:sha256:${createHash("sha256")
+    .update(JSON.stringify({ evidencePath: settled, kind: "quarantine", logicalPath: "notes/third.md", scope: "file" }))
+    .digest("hex")}`;
   const missingId = `evidence:sha256:${createHash("sha256")
     .update(JSON.stringify({ evidencePath: missing, kind: "quarantine", logicalPath: "notes/other.md", scope: "file" }))
     .digest("hex")}`;
@@ -482,6 +521,16 @@ test("doctor keeps listing resolvable evidence beside a record that cannot be re
       contentDigest: `sha256:${createHash("sha256").update("gone\n").digest("hex")}`,
       kind: "quarantine",
       logicalPath: "notes/other.md",
+      scope: "file",
+      transition: "retained",
+    },
+    {
+      evidenceId: settledId,
+      evidencePath: settled,
+      evidenceIdentity: "1:1",
+      contentDigest: `sha256:${createHash("sha256").update("gone\n").digest("hex")}`,
+      kind: "quarantine",
+      logicalPath: "notes/third.md",
       scope: "file",
       transition: "resolving",
       resolution: {
@@ -510,6 +559,7 @@ test("doctor keeps listing resolvable evidence beside a record that cannot be re
   const unreviewable = issues.find((candidate) => candidate.file === `.gsd/${missing}`);
   assert.ok(unreviewable, "the unreviewable record is still reported");
   assert.match(unreviewable.message, /could not be reviewed/u);
+  assert.equal(issues.some((candidate) => candidate.file === `.gsd/${settled}`), false);
 });
 
 test(
