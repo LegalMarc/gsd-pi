@@ -402,6 +402,32 @@ describe("#2442 doctor surfaces primary_sink_failed observation loss", () => {
     assert.match(loss!.message, /1 lifecycle-shadow observation was lost/, "unrelated mentions must not count");
   });
 
+  test("finds loss events among many unrelated audit lines, CRLF and an unterminated last line (#2873)", () => {
+    const base = makeTmpBase();
+    const auditDir = join(base, ".gsd", "audit");
+    mkdirSync(auditDir, { recursive: true });
+    const unrelated = (index: number) => JSON.stringify({
+      eventId: `evt-unit-${index}`,
+      type: "unit-blocked",
+      ts: "2026-07-12T00:00:00.000Z",
+      payload: { unitId: `M001/S01/T${index}` },
+    });
+    const lines: string[] = [JSON.stringify(lossEvent("primary_sink_failed"))];
+    for (let index = 0; index < 5_000; index += 1) lines.push(unrelated(index));
+    lines.push(JSON.stringify(lossEvent("primary_sink_failed")));
+    lines.push(JSON.stringify(lossEvent("projection_sink_failed")));
+    for (let index = 5_000; index < 10_000; index += 1) lines.push(unrelated(index));
+    lines.push(JSON.stringify(lossEvent("primary_sink_failed")));
+    writeFileSync(join(auditDir, "events.jsonl"), lines.join("\r\n"));
+    const issues: DoctorIssue[] = [];
+
+    checkLifecycleShadowObservationLoss(base, issues);
+
+    const loss = issues.find((issue) => issue.code === "lifecycle_shadow_observation_loss");
+    assert.ok(loss, "loss events between unrelated audit lines must surface");
+    assert.match(loss!.message, /3 lifecycle-shadow observations were lost/);
+  });
+
   test("ignores projection_sink_failed losses and clean projects", () => {
     const withOtherReason = makeTmpBase();
     writeLossEvent(withOtherReason, "projection_sink_failed");

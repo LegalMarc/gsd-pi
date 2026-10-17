@@ -58,9 +58,11 @@ import { readMilestoneCloseoutAuthorization } from "./db/milestone-closeout-read
 import { isDeadLocalAutoWorker } from "./db/auto-workers.js";
 import { countUnadoptedHierarchyRows, previewLifecycleBackfill } from "./lifecycle-backfill-domain-operation.js";
 import { loadEffectiveGSDPreferences } from "./preferences.js";
+import type { GSDPreferences } from "./preferences-types.js";
 import {
   captureMilestoneVerificationSourceRevision,
   diagnoseMilestoneVerificationSourceDrift,
+  type MilestoneVerificationSourceRevisionResult,
   type VerificationSourceDriftDiagnosis,
 } from "./verification-source-integrity.js";
 import {
@@ -640,11 +642,24 @@ export function createValidationSourceDriftDoctorIssue(
 }
 
 export function reportMilestoneValidationSourceDrift(basePath: string, issues: DoctorIssue[]): void {
+  // Closed milestones usually resolve to the same tree (always under
+  // isolation: none, and once their worktrees are gone), so the revision and
+  // drift diagnosis are computed once per source root, not per milestone (#2873).
+  const sourceByRoot = new Map<string, {
+    preferences: GSDPreferences | undefined;
+    source: MilestoneVerificationSourceRevisionResult;
+    drift?: VerificationSourceDriftDiagnosis;
+  }>();
   for (const milestone of readMilestones()) {
     if (!milestone.closed) continue;
     const sourceRoot = resolveCanonicalMilestoneRoot(basePath, milestone.id);
-    const preferences = loadEffectiveGSDPreferences(sourceRoot)?.preferences;
-    const source = captureMilestoneVerificationSourceRevision(sourceRoot, preferences);
+    let rootSource = sourceByRoot.get(sourceRoot);
+    if (!rootSource) {
+      const preferences = loadEffectiveGSDPreferences(sourceRoot)?.preferences;
+      rootSource = { preferences, source: captureMilestoneVerificationSourceRevision(sourceRoot, preferences) };
+      sourceByRoot.set(sourceRoot, rootSource);
+    }
+    const { source } = rootSource;
     if (!source.ok) continue;
     const authorization = readMilestoneCloseoutAuthorization({
       milestoneId: milestone.id,
@@ -655,10 +670,11 @@ export function reportMilestoneValidationSourceDrift(basePath: string, issues: D
       (blocker) => blocker.kind === "validation-source-revision-mismatch",
     );
     if (!mismatch || mismatch.kind !== "validation-source-revision-mismatch") continue;
+    rootSource.drift ??= diagnoseMilestoneVerificationSourceDrift(sourceRoot, rootSource.preferences);
     issues.push(createValidationSourceDriftDoctorIssue(
       milestone.id,
       mismatch,
-      diagnoseMilestoneVerificationSourceDrift(sourceRoot, preferences),
+      rootSource.drift,
     ));
   }
 }
@@ -1699,14 +1715,14 @@ export function checkLifecycleShadowObservationLoss(basePath: string, issues: Do
   const surfacesHit: string[] = [];
   for (const surface of surfaces) {
     if (!existsSync(surface.path)) continue;
-    let content: string;
+    let content: Buffer;
     try {
-      content = readFileSync(surface.path, "utf-8");
+      content = readFileSync(surface.path);
     } catch {
       continue;
     }
     let count = 0;
-    for (const line of content.split("\n")) {
+    for (const line of linesContaining(content, LIFECYCLE_SHADOW_LOSS_MARKER)) {
       const trimmed = line.trim();
       if (!trimmed.startsWith("{")) continue;
       let event: { eventId?: unknown; type?: unknown; ts?: unknown; payload?: unknown };
@@ -1792,4 +1808,26 @@ function primarySinkLossReason(payload: unknown): boolean {
     Boolean(cause) && typeof cause === "object" &&
     (cause as { reason?: unknown }).reason === "primary_sink_failed",
   );
+}
+
+const LIFECYCLE_SHADOW_LOSS_MARKER = Buffer.from("lifecycle-shadow-observation-loss");
+
+/**
+ * The lines of a JSONL audit surface that contain `marker`. Audit projections
+ * only grow (every blocked unit appends events), so splitting and parsing every
+ * line made each doctor run O(file) in JSON work (#2873). Every serialized
+ * event of the wanted type carries its type string verbatim, so lines without
+ * it cannot match; the caller still decides structurally after parsing.
+ */
+function* linesContaining(content: Buffer, marker: Buffer): Generator<string> {
+  let from = 0;
+  for (;;) {
+    const hit = content.indexOf(marker, from);
+    if (hit === -1) return;
+    const start = content.lastIndexOf(0x0a, hit) + 1;
+    const newline = content.indexOf(0x0a, hit);
+    const end = newline === -1 ? content.length : newline;
+    yield content.toString("utf8", start, end);
+    from = end + 1;
+  }
 }

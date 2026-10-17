@@ -41,6 +41,10 @@ import { handleValidateMilestone } from "../tools/validate-milestone.ts";
 import { renderMilestoneValidation } from "../markdown-renderer.ts";
 import { observeExternalMarkdownEdits } from "../state-reconciliation/drift/external-markdown-edit.ts";
 import { deriveStateFromDb } from "../state.ts";
+import {
+  getVerificationSourceContentPassCountForTests,
+  resetVerificationSourceRevisionCacheForTests,
+} from "../verification-source-integrity.ts";
 import { cutOver } from "./helpers/authority-cutover.ts";
 
 const tempDirs = new Set<string>();
@@ -625,6 +629,38 @@ test("after the Cutover doctor reports validation source drift of a Milestone th
   cutOver();
 
   assert.deepEqual(drifted(), ["validation_source_revision_mismatch M001"]);
+});
+
+test("doctor computes the validation source once for closed milestones that share a tree (#2873)", async () => {
+  const basePath = makeFixture();
+  const rule = DISPATCH_RULES.find((candidate) =>
+    candidate.name === "validating-milestone → validate-milestone"
+  );
+  assert.ok(rule);
+  assert.equal((await rule.match(dispatchContext(basePath)))?.action, "dispatch");
+  writeFileSync(join(basePath, "source.ts"), "export const source = 'changed-after-waiver';\n");
+  insertMilestone({ id: "M002", title: "Closed earlier", status: "complete" });
+  insertMilestone({ id: "M003", title: "Closed earlier too", status: "complete" });
+  executeAtFence("milestone.complete", (context) => {
+    for (const milestoneId of ["M001", "M002", "M003"]) {
+      adoptOrTransitionLifecycle(context, { itemKind: "milestone", milestoneId, lifecycleStatus: "completed" });
+    }
+  });
+  cutOver();
+  resetVerificationSourceRevisionCacheForTests();
+
+  const issues: DoctorIssue[] = [];
+  reportMilestoneValidationSourceDrift(basePath, issues);
+
+  assert.deepEqual(
+    issues.map((issue) => `${issue.code} ${issue.unitId}`),
+    ["validation_source_revision_mismatch M001"],
+  );
+  assert.equal(
+    getVerificationSourceContentPassCountForTests(),
+    2,
+    "three closed milestones on one tree need one stable source capture, not one per milestone",
+  );
 });
 
 test("source changes after a passing validation do not cut state derivation over to canonical authority", async () => {

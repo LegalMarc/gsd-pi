@@ -3,7 +3,7 @@
 
 import { createHash, type Hash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { closeSync, lstatSync, openSync, readSync, readlinkSync, realpathSync } from "node:fs";
+import { closeSync, lstatSync, openSync, readSync, readlinkSync, realpathSync, type BigIntStats } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
 import type { SliceRow, TaskRow } from "./db-task-slice-rows.js";
 import type { GSDPreferences } from "./preferences-types.js";
@@ -77,6 +77,94 @@ const SOURCE_PATHSPEC = [
   ":(exclude).gsd/**",
   ":(exclude)receipts/**",
 ];
+
+/**
+ * A target revision costs one full read of every source byte, and a stable
+ * capture reads the tree twice. Doctor, dispatch, prompts, and record writers
+ * all ask for the same tree again and again, so on a large repository the same
+ * bytes were hashed dozens of times per command (#2873). A confirmed revision
+ * is reused while every listed path keeps the same lstat identity (type, size,
+ * mtime, ctime, inode, device, mode), the same trust git applies to its index.
+ * Revisions are cached only when both stability samples agree on bytes and
+ * stats and no entry was modified within the racy window before the capture
+ * started, so a write that lands inside one timestamp tick is never hidden.
+ * Nested repositories and missing tracked paths are never cached: their
+ * publishability is checked through git, not through the parent's lstat.
+ */
+const RACY_WINDOW_NS = 2_000_000_000n;
+const MAX_CACHED_TARGET_REVISIONS = 16;
+const targetRevisionCache = new Map<string, { fingerprint: string; revision: string }>();
+let sourceContentPasses = 0;
+
+/** Test-only: number of target revisions computed by reading file content. */
+export function getVerificationSourceContentPassCountForTests(): number {
+  return sourceContentPasses;
+}
+
+/** Test-only: forget every cached target revision. */
+export function resetVerificationSourceRevisionCacheForTests(): void {
+  targetRevisionCache.clear();
+  sourceContentPasses = 0;
+}
+
+interface SourceEntry {
+  path: string;
+  stat: BigIntStats | null;
+}
+
+interface TargetRevisionPass extends VerificationTargetRevision {
+  cacheKey: string;
+  fingerprint: string;
+  cacheable: boolean;
+  fromCache: boolean;
+}
+
+function targetCacheKey(target: VerificationSourceTarget, options: VerificationSourceSnapshotOptions): string {
+  return JSON.stringify([target.cwd, [...(options.excludePaths ?? [])]]);
+}
+
+function readSourceEntry(cwd: string, path: string): SourceEntry {
+  try {
+    return { path, stat: lstatSync(join(cwd, path), { bigint: true }) };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { path, stat: null };
+    throw error;
+  }
+}
+
+function fingerprintSourceEntries(
+  entries: readonly SourceEntry[],
+  startedAtNs: bigint,
+): { fingerprint: string; cacheable: boolean } {
+  const hash = createHash("sha256");
+  let cacheable = true;
+  const racyAfterNs = startedAtNs - RACY_WINDOW_NS;
+  for (const { path, stat } of entries) {
+    hash.update(path);
+    hash.update("\0");
+    if (!stat) {
+      cacheable = false;
+      hash.update("missing\0");
+      continue;
+    }
+    if (stat.isDirectory()) cacheable = false;
+    if (stat.mtimeNs >= racyAfterNs || stat.ctimeNs >= racyAfterNs) cacheable = false;
+    const kind = stat.isFile() ? "file" : stat.isSymbolicLink() ? "symlink" : stat.isDirectory() ? "directory" : "other";
+    hash.update([kind, stat.size, stat.mtimeNs, stat.ctimeNs, stat.ino, stat.dev, stat.mode].join(":"));
+    hash.update("\0");
+  }
+  return { fingerprint: hash.digest("hex"), cacheable };
+}
+
+function rememberTargetRevision(pass: TargetRevisionPass): void {
+  targetRevisionCache.delete(pass.cacheKey);
+  targetRevisionCache.set(pass.cacheKey, { fingerprint: pass.fingerprint, revision: pass.revision });
+  while (targetRevisionCache.size > MAX_CACHED_TARGET_REVISIONS) {
+    const oldest = targetRevisionCache.keys().next().value;
+    if (oldest === undefined) break;
+    targetRevisionCache.delete(oldest);
+  }
+}
 
 /**
  * Git pathspecs match tracked path names, not symlink targets. In a GSD-managed
@@ -306,19 +394,13 @@ function addSubmoduleRevision(hash: Hash, cwd: string, path: string): void {
   addHashField(hash, "source-repository", entry.objectId);
 }
 
-function addSourceEntry(hash: Hash, cwd: string, path: string): void {
+function addSourceEntry(hash: Hash, cwd: string, { path, stat }: SourceEntry): void {
   const absolutePath = join(cwd, path);
-  let stat: ReturnType<typeof lstatSync>;
-  try {
-    stat = lstatSync(absolutePath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      if (trackedEntry(cwd, path)?.mode === "160000") {
-        throw new Error(`verification source submodule is unavailable: ${path}`);
-      }
-      return;
+  if (!stat) {
+    if (trackedEntry(cwd, path)?.mode === "160000") {
+      throw new Error(`verification source submodule is unavailable: ${path}`);
     }
-    throw error;
+    return;
   }
   addHashField(hash, "source-path", path);
   if (stat.isSymbolicLink()) {
@@ -327,8 +409,8 @@ function addSourceEntry(hash: Hash, cwd: string, path: string): void {
     return;
   }
   if (stat.isFile()) {
-    addHashField(hash, "source-mode", (stat.mode & 0o111) === 0 ? "100644" : "100755");
-    addFileHashField(hash, "source-content", absolutePath, stat.size);
+    addHashField(hash, "source-mode", (stat.mode & 0o111n) === 0n ? "100644" : "100755");
+    addFileHashField(hash, "source-content", absolutePath, Number(stat.size));
     return;
   }
   if (stat.isDirectory()) {
@@ -342,29 +424,49 @@ function addSourceEntry(hash: Hash, cwd: string, path: string): void {
 function captureTargetRevision(
   target: VerificationSourceTarget,
   options: VerificationSourceSnapshotOptions,
-): VerificationTargetRevision {
+): TargetRevisionPass {
+  const startedAtNs = BigInt(Date.now()) * 1_000_000n;
+  const entries = sourcePaths(target.cwd, options).map((path) => readSourceEntry(target.cwd, path));
+  const { fingerprint, cacheable } = fingerprintSourceEntries(entries, startedAtNs);
+  const cacheKey = targetCacheKey(target, options);
+  const cached = targetRevisionCache.get(cacheKey);
+  if (cached && cached.fingerprint === fingerprint) {
+    return { targetId: target.id, revision: cached.revision, cacheKey, fingerprint, cacheable, fromCache: true };
+  }
+  sourceContentPasses += 1;
   const hash = createHash("sha256");
-  for (const path of sourcePaths(target.cwd, options)) addSourceEntry(hash, target.cwd, path);
-  return { targetId: target.id, revision: `sha256:${hash.digest("hex")}` };
+  for (const entry of entries) addSourceEntry(hash, target.cwd, entry);
+  return {
+    targetId: target.id,
+    revision: `sha256:${hash.digest("hex")}`,
+    cacheKey,
+    fingerprint,
+    cacheable,
+    fromCache: false,
+  };
 }
+
+type SnapshotPassResult =
+  | { ok: true; snapshot: VerificationSourceSnapshot; passes: TargetRevisionPass[] }
+  | { ok: false; targetId: string; error: string };
 
 function captureVerificationSourceSnapshotOnce(
   targets: VerificationSourceTarget[],
   options: VerificationSourceSnapshotOptions = {},
-): VerificationSourceSnapshotResult {
+): SnapshotPassResult {
   if (targets.length === 0) {
     return { ok: false, targetId: "<targets>", error: "Verification source snapshot requires at least one target repository" };
   }
   const ordered = [...targets].sort((left, right) => left.id.localeCompare(right.id));
   const seen = new Set<string>();
-  const revisions: VerificationTargetRevision[] = [];
+  const passes: TargetRevisionPass[] = [];
   for (const target of ordered) {
     if (seen.has(target.id)) {
       return { ok: false, targetId: target.id, error: `Duplicate verification source target: ${target.id}` };
     }
     seen.add(target.id);
     try {
-      revisions.push(captureTargetRevision(target, options));
+      passes.push(captureTargetRevision(target, options));
     } catch (error) {
       return {
         ok: false,
@@ -373,6 +475,7 @@ function captureVerificationSourceSnapshotOnce(
       };
     }
   }
+  const revisions = passes.map(({ targetId, revision }) => ({ targetId, revision }));
   const aggregate = createHash("sha256");
   for (const target of revisions) {
     addHashField(aggregate, "target-id", target.targetId);
@@ -384,14 +487,15 @@ function captureVerificationSourceSnapshotOnce(
       aggregateRevision: `sha256:${aggregate.digest("hex")}`,
       targets: revisions,
     },
+    passes,
   };
 }
 
-export function confirmVerificationSourceSnapshot(
+function confirmSnapshotPass(
   targets: VerificationSourceTarget[],
   expected: VerificationSourceSnapshot,
-  options: VerificationSourceSnapshotOptions = {},
-): VerificationSourceSnapshotResult {
+  options: VerificationSourceSnapshotOptions,
+): SnapshotPassResult {
   const confirmation = captureVerificationSourceSnapshotOnce(targets, options);
   if (!confirmation.ok) return confirmation;
   if (!verificationSourceChanged(expected, confirmation.snapshot)) return confirmation;
@@ -406,13 +510,35 @@ export function confirmVerificationSourceSnapshot(
   };
 }
 
+function publicSnapshotResult(result: SnapshotPassResult): VerificationSourceSnapshotResult {
+  return result.ok ? { ok: true, snapshot: result.snapshot } : result;
+}
+
+export function confirmVerificationSourceSnapshot(
+  targets: VerificationSourceTarget[],
+  expected: VerificationSourceSnapshot,
+  options: VerificationSourceSnapshotOptions = {},
+): VerificationSourceSnapshotResult {
+  return publicSnapshotResult(confirmSnapshotPass(targets, expected, options));
+}
+
 export function captureVerificationSourceSnapshot(
   targets: VerificationSourceTarget[],
   options: VerificationSourceSnapshotOptions = {},
 ): VerificationSourceSnapshotResult {
   const first = captureVerificationSourceSnapshotOnce(targets, options);
   if (!first.ok) return first;
-  return confirmVerificationSourceSnapshot(targets, first.snapshot, options);
+  // Every target matched a revision that was already confirmed stable.
+  if (first.passes.every((pass) => pass.fromCache)) return publicSnapshotResult(first);
+  const confirmation = confirmSnapshotPass(targets, first.snapshot, options);
+  if (!confirmation.ok) return confirmation;
+  for (const [index, pass] of first.passes.entries()) {
+    const confirmed = confirmation.passes[index];
+    if (pass.fromCache || !pass.cacheable || !confirmed?.cacheable) continue;
+    if (confirmed.fingerprint !== pass.fingerprint) continue;
+    rememberTargetRevision(pass);
+  }
+  return publicSnapshotResult(confirmation);
 }
 
 export function captureMilestoneVerificationSourceRevision(

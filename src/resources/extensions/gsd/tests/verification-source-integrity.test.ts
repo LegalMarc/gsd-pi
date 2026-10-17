@@ -3,16 +3,19 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import {
   captureMilestoneVerificationSourceRevision,
   captureVerificationSourceSnapshot,
   confirmVerificationSourceSnapshot,
   diagnoseMilestoneVerificationSourceDrift,
+  getVerificationSourceContentPassCountForTests,
+  resetVerificationSourceRevisionCacheForTests,
   resolveVerificationRepositoryTargets,
   verificationSourceChanged,
   verificationSourceSnapshotOptions,
@@ -48,6 +51,109 @@ function capture(
 afterEach(() => {
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
   tempDirs.clear();
+  resetVerificationSourceRevisionCacheForTests();
+});
+
+// A revision is reused only once every entry is older than the racy window
+// (2 s) at capture time. ctime cannot be backdated, so cache tests wait.
+async function outlastRacyWindow(): Promise<void> {
+  await delay(2_100);
+}
+
+async function createAgedRepository(name: string): Promise<string> {
+  const cwd = createRepository(name);
+  writeFileSync(join(cwd, "untracked.txt"), "untracked\n");
+  await outlastRacyWindow();
+  resetVerificationSourceRevisionCacheForTests();
+  return cwd;
+}
+
+test("an unchanged tree is read for one stable capture, then reused by stat identity (#2873)", async () => {
+  const cwd = await createAgedRepository("cache-hit");
+  const targets = [{ id: "root", cwd }];
+
+  const first = capture(targets);
+  assert.equal(getVerificationSourceContentPassCountForTests(), 2, "capture and confirm read content once each");
+
+  for (let index = 0; index < 5; index += 1) {
+    assert.deepEqual(capture(targets), first);
+  }
+  const confirmed = confirmVerificationSourceSnapshot(targets, first);
+  assert.equal(confirmed.ok, true);
+  assert.equal(
+    getVerificationSourceContentPassCountForTests(),
+    2,
+    "repeated captures of an unchanged tree must not re-read file content",
+  );
+});
+
+test("a cached revision is not reused after a same-size rewrite that restores mtime", async () => {
+  const cwd = await createAgedRepository("cache-rewrite");
+  const targets = [{ id: "root", cwd }];
+  const cached = capture(targets);
+  const path = join(cwd, "tracked.txt");
+  const before = statSync(path);
+
+  writeFileSync(path, "BASE\n");
+  utimesSync(path, before.atime, before.mtime);
+  const rewritten = capture(targets);
+
+  assert.notEqual(rewritten.aggregateRevision, cached.aggregateRevision);
+  resetVerificationSourceRevisionCacheForTests();
+  assert.deepEqual(capture(targets), rewritten, "the reported revision is the uncached content revision");
+});
+
+test("a cached revision is not reused after an untracked file appears", async () => {
+  const cwd = await createAgedRepository("cache-untracked");
+  const targets = [{ id: "root", cwd }];
+  const cached = capture(targets);
+
+  writeFileSync(join(cwd, "new-source.txt"), "new\n");
+
+  assert.notEqual(capture(targets).aggregateRevision, cached.aggregateRevision);
+});
+
+test("a cached revision cannot confirm a tree that mutated after it", async () => {
+  const cwd = await createAgedRepository("cache-confirm");
+  const targets = [{ id: "root", cwd }];
+  const cached = capture(targets);
+
+  writeFileSync(join(cwd, "tracked.txt"), "mutated after the cached capture\n");
+  const confirmation = confirmVerificationSourceSnapshot(targets, cached);
+
+  assert.equal(confirmation.ok, false);
+  if (confirmation.ok) assert.fail("mutated source unexpectedly confirmed from cache");
+  assert.match(confirmation.error, /changed while confirming/);
+});
+
+test("entries modified inside the racy window are re-read on every capture", () => {
+  const cwd = createRepository("cache-racy");
+  const targets = [{ id: "root", cwd }];
+  resetVerificationSourceRevisionCacheForTests();
+
+  const first = capture(targets);
+  const second = capture(targets);
+
+  assert.deepEqual(second, first);
+  assert.equal(getVerificationSourceContentPassCountForTests(), 4, "fresh entries are never served from cache");
+});
+
+test("a tree with a nested repository is re-read on every capture", async () => {
+  const upstream = createRepository("cache-submodule-upstream");
+  const cwd = createRepository("cache-submodule-parent");
+  git(cwd, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", upstream, "vendor/dependency"]);
+  git(cwd, ["commit", "-qam", "add dependency"]);
+  await outlastRacyWindow();
+  resetVerificationSourceRevisionCacheForTests();
+  const targets = [{ id: "root", cwd }];
+
+  capture(targets);
+  capture(targets);
+  assert.equal(getVerificationSourceContentPassCountForTests(), 4);
+
+  writeFileSync(join(cwd, "vendor/dependency/tracked.txt"), "unpublished\n");
+  const result = captureVerificationSourceSnapshot(targets);
+  assert.equal(result.ok, false, "submodule publishability is still checked after earlier captures");
 });
 
 test("parent-workspace verification defaults to the orchestration root", () => {
