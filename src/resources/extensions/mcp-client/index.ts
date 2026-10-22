@@ -57,17 +57,44 @@ const MCP_TRUST_CONFIRM_TIMEOUT_MS = 120_000;
 // server operation still commits.
 const DEFAULT_WORKFLOW_MCP_CALL_TIMEOUT_MS = 5 * 60 * 1000;
 const MCP_CALL_TIMEOUT_MS = 60_000;
+// gsd_exec / gsd_uat_exec bound themselves at the exec clamp (60 minutes, EXEC_CLAMP_TIMEOUT_MS)
+// and run outside the server's operation queue, so the client waits that plus a minute for them.
+const WORKFLOW_EXEC_CALL_TIMEOUT_MS = 3_600_000 + 60_000;
+const WORKFLOW_EXEC_TOOLS = new Set(["gsd_exec", "gsd_uat_exec"]);
 // Largest delay setTimeout accepts; GSD_MCP_WORKFLOW_TIMEOUT_MS=0 disables the timeout.
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
-function mcpCallTimeoutMs(server: string, env: NodeJS.ProcessEnv = process.env): number {
+function mcpCallTimeoutMs(server: string, env: NodeJS.ProcessEnv = process.env, tool?: string): number {
 	const workflowServer = env.GSD_WORKFLOW_MCP_NAME?.trim() || "gsd-workflow";
 	if (server.trim().toLowerCase() !== workflowServer.toLowerCase()) return MCP_CALL_TIMEOUT_MS;
 	const raw = env.GSD_MCP_WORKFLOW_TIMEOUT_MS?.trim();
-	if (!raw) return DEFAULT_WORKFLOW_MCP_CALL_TIMEOUT_MS;
+	const fallback = tool && WORKFLOW_EXEC_TOOLS.has(tool) ? WORKFLOW_EXEC_CALL_TIMEOUT_MS : DEFAULT_WORKFLOW_MCP_CALL_TIMEOUT_MS;
+	if (!raw) return fallback;
 	const parsed = Number.parseInt(raw, 10);
-	if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_WORKFLOW_MCP_CALL_TIMEOUT_MS;
-	return parsed === 0 ? MAX_TIMER_DELAY_MS : parsed;
+	if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+	if (parsed === 0) return MAX_TIMER_DELAY_MS;
+	return tool && WORKFLOW_EXEC_TOOLS.has(tool) ? Math.max(parsed, WORKFLOW_EXEC_CALL_TIMEOUT_MS) : parsed;
+}
+
+/**
+ * Request options for one call. The workflow server's exec tools send a progress
+ * notification every minute while their command runs, so the client asks for
+ * progress on them and each notification restarts the wait: a call that is
+ * still waiting in the server's queue, or running near the clamp, is not cut off
+ * while the server reports it alive.
+ */
+function mcpCallRequestOptions(server: string, tool: string, signal: AbortSignal | undefined, env: NodeJS.ProcessEnv = process.env) {
+	const timeout = mcpCallTimeoutMs(server, env, tool);
+	const workflowServer = env.GSD_WORKFLOW_MCP_NAME?.trim() || "gsd-workflow";
+	const execTool = server.trim().toLowerCase() === workflowServer.toLowerCase() && WORKFLOW_EXEC_TOOLS.has(tool);
+	return execTool
+		? { signal, timeout, resetTimeoutOnProgress: true, onprogress: () => {} }
+		: { signal, timeout };
+}
+
+/** @internal — exported for testing only */
+export function _mcpCallTimeoutMsForTest(server: string, env: NodeJS.ProcessEnv, tool?: string): number {
+	return mcpCallTimeoutMs(server, env, tool);
 }
 const emptyStdioTrustPromptQueue = Promise.resolve();
 let stdioTrustPromptQueue: Promise<void> = emptyStdioTrustPromptQueue;
@@ -605,7 +632,7 @@ export default function (pi: ExtensionAPI) {
 						},
 					},
 					undefined,
-					{ signal, timeout: mcpCallTimeoutMs(params.server) },
+					mcpCallRequestOptions(params.server, params.tool, signal),
 				);
 
 				// Serialize result content to text

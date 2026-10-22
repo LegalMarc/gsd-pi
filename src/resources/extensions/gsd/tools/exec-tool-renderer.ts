@@ -226,8 +226,14 @@ export function renderExecResult(result: unknown, _options: unknown, theme: Them
 	const content = sanitizeExecDisplayText(resultContentText(record)).trim();
 
 	const notRecorded = detailString(details, "run_not_recorded");
+	const recordUnknown = detailString(details, "run_record_outcome") === "unknown";
 	const notRecordedRow = notRecorded
-		? theme.fg("warning", `not recorded (${sanitizeExecDisplayText(notRecorded)}) — not verification or UAT evidence`)
+		? theme.fg(
+				"warning",
+				recordUnknown
+					? `record unknown (${sanitizeExecDisplayText(notRecorded)}) — not evidence unless found recorded`
+					: `not recorded (${sanitizeExecDisplayText(notRecorded)}) — not verification or UAT evidence`,
+			)
 		: undefined;
 
 	if (record?.isError === true) {

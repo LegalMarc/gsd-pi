@@ -3,7 +3,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -12,6 +12,9 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 import { symlinkSync, realpathSync } from "node:fs";
 import { SUMMARY_SAVE_CONTENT_MAX_LENGTH } from "@opengsd/contracts";
@@ -50,6 +53,8 @@ import {
   _parseWorkflowArgsForTest,
   _summarySaveSchemaForTest,
   _runSerializedWorkflowOperationForTest,
+  EXEC_CLAMP_TIMEOUT_MS,
+  EXEC_PROGRESS_INTERVAL_MS,
   _sliceCompleteSchemaForTest,
 } from "./workflow-tools.ts";
 
@@ -492,6 +497,243 @@ describe("runSerializedWorkflowOperation", () => {
       } else {
         process.env.GSD_MCP_WORKFLOW_TIMEOUT_MS = previousTimeout;
       }
+    }
+  });
+});
+
+describe("workflow MCP exec and the operation queue", () => {
+  it("runs a gsd_exec command outside the workflow queue and past the operation deadline", async (t) => {
+    const previousTimeout = process.env.GSD_MCP_WORKFLOW_TIMEOUT_MS;
+    const base = makeTmpBase();
+    t.after(() => {
+      if (previousTimeout === undefined) delete process.env.GSD_MCP_WORKFLOW_TIMEOUT_MS;
+      else process.env.GSD_MCP_WORKFLOW_TIMEOUT_MS = previousTimeout;
+      cleanup(base);
+    });
+    process.env.GSD_MCP_WORKFLOW_TIMEOUT_MS = "100";
+    const server = makeMockServer();
+    registerWorkflowTools(server as any);
+    const tool = server.tools.find((x) => x.name === "gsd_exec");
+    assert.ok(tool, "exec tool should be registered");
+
+    let execDone = false;
+    const exec = tool!.handler({
+      projectDir: base,
+      runtime: "node",
+      script: "setTimeout(() => console.log('slow-exec-done'), 400);",
+      timeout_ms: 10_000,
+    }).then((result) => {
+      execDone = true;
+      return result as any;
+    });
+    await delay(50);
+    // Another workflow operation is not queued behind the running command.
+    assert.equal(await _runSerializedWorkflowOperationForTest(async () => "other"), "other");
+    assert.equal(execDone, false, "the command is still running");
+
+    // The command outlives the 100 ms operation deadline and still returns its own result.
+    const record = await exec;
+    assert.equal(record.isError, false);
+    assert.match(record.content[0].text as string, /slow-exec-done/);
+  });
+
+  it("stores a gsd_exec run only when the workflow queue is free, after the command ran outside it", async (t) => {
+    const base = makeTmpBase();
+    t.after(() => cleanup(base));
+    seedContextModeFixture(base);
+    const server = makeMockServer();
+    registerWorkflowTools(server as any);
+    const tool = server.tools.find((x) => x.name === "gsd_exec");
+    assert.ok(tool, "exec tool should be registered");
+
+    const execDir = join(base, ".gsd", "exec");
+    const started = join(base, "command-started");
+    const call = tool!.handler({
+      projectDir: base,
+      runtime: "node",
+      script: `require("node:fs").writeFileSync(${JSON.stringify(started)}, "1"); setTimeout(() => console.log('queued-record-done'), 300);`,
+      timeout_ms: 10_000,
+    }) as Promise<any>;
+
+    // Wait until the command has started, then hold the queue.
+    for (let i = 0; i < 500 && !existsSync(started); i++) await delay(10);
+    assert.ok(existsSync(started), "the command started");
+    let release!: () => void;
+    const held = _runSerializedWorkflowOperationForTest(() => new Promise<void>((resolve) => { release = resolve; }));
+    // The command finishes while the queue is held: its meta.json is written by the sandbox at the end.
+    for (let i = 0; i < 300 && !readdirSync(execDir).some((f) => f.endsWith(".meta.json")); i++) await delay(10);
+    const metaFile = readdirSync(execDir).find((f) => f.endsWith(".meta.json"));
+    assert.ok(metaFile, "the command finished while the queue was held");
+    const id = metaFile!.replace(/\.meta\.json$/, "");
+    await delay(50);
+    const rowCount = () => {
+      const db = new DatabaseSync(join(base, ".gsd", "gsd.db"), { readOnly: true });
+      try {
+        return Number((db.prepare("SELECT COUNT(*) AS n FROM exec_runs WHERE id = ?").get(id) as { n: number }).n);
+      } finally {
+        db.close();
+      }
+    };
+    assert.equal(rowCount(), 0, "the run is not stored while another workflow operation holds the queue");
+
+    release();
+    await held;
+    const record = await call;
+    assert.equal(record.isError, false, JSON.stringify(record));
+    assert.match(record.content[0].text as string, /queued-record-done/);
+    assert.equal(rowCount(), 1, "the run is stored once the queue is free");
+  });
+
+  // Claude Code ends a stdio MCP call that shows no result or progress for 30
+  // minutes, shorter than the 60-minute exec clamp.
+  const execProgressArgs: Record<string, Record<string, unknown>> = {
+    gsd_exec: {},
+    gsd_uat_exec: { milestoneId: "M001", sliceId: "S01", checkId: "UAT-01", intent: "uat-runtime-check" },
+  };
+
+  for (const name of ["gsd_exec", "gsd_uat_exec"]) {
+    it(`${name} sends a progress notification every interval while its command runs, and none after`, async (t) => {
+      t.mock.timers.enable({ apis: ["setInterval"] });
+      const base = makeTmpBase();
+      t.after(() => cleanup(base));
+      seedContextModeFixture(base);
+      const server = makeMockServer();
+      registerWorkflowTools(server as any);
+      const tool = server.tools.find((x) => x.name === name);
+      assert.ok(tool, `${name} should be registered`);
+
+      const sent: Array<{ method: string; params?: Record<string, unknown> }> = [];
+      let done = false;
+      const call = tool!.handler(
+        {
+          projectDir: base,
+          ...execProgressArgs[name],
+          runtime: "node",
+          script: "setTimeout(() => console.log('beat-done'), 600);",
+          timeout_ms: 10_000,
+        },
+        {
+          _meta: { progressToken: `token-${name}` },
+          sendNotification: async (notification: { method: string; params?: Record<string, unknown> }) => {
+            sent.push(notification);
+          },
+        } as any,
+      ).then((result) => {
+        done = true;
+        return result as any;
+      });
+
+      await delay(100);
+      t.mock.timers.tick(EXEC_PROGRESS_INTERVAL_MS);
+      t.mock.timers.tick(EXEC_PROGRESS_INTERVAL_MS);
+      await delay(0);
+      assert.equal(done, false, "the command is still running");
+      assert.deepEqual(
+        sent.map((n) => [n.method, n.params?.progressToken, n.params?.progress]),
+        [
+          ["notifications/progress", `token-${name}`, 1],
+          ["notifications/progress", `token-${name}`, 2],
+        ],
+      );
+
+      const record = await call;
+      assert.equal(record.isError, false, JSON.stringify(record));
+      assert.match(record.content[0].text as string, /beat-done/);
+      t.mock.timers.tick(EXEC_PROGRESS_INTERVAL_MS * 3);
+      await delay(0);
+      assert.equal(sent.length, 2, "no progress after the result");
+    });
+  }
+
+  it("delivers gsd_exec progress to a real MCP client that asks for it", async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const base = makeTmpBase();
+    const server = new McpServer({ name: "exec-progress-test", version: "1.0.0" }, { capabilities: { tools: {} } });
+    registerWorkflowTools(server as any);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "exec-progress-client", version: "1.0.0" });
+    t.after(async () => {
+      await client.close();
+      await server.close();
+      cleanup(base);
+    });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const progress: number[] = [];
+    const call = client.callTool(
+      {
+        name: "gsd_exec",
+        arguments: {
+          projectDir: base,
+          runtime: "node",
+          script: "setTimeout(() => console.log('client-beat-done'), 600);",
+          timeout_ms: 10_000,
+        },
+      },
+      undefined,
+      { onprogress: (p) => progress.push(p.progress), timeout: 30_000 },
+    );
+    await delay(150);
+    t.mock.timers.tick(EXEC_PROGRESS_INTERVAL_MS);
+    await delay(10);
+    t.mock.timers.tick(EXEC_PROGRESS_INTERVAL_MS);
+    await delay(10);
+    assert.deepEqual(progress, [1, 2]);
+    const result = (await call) as any;
+    assert.equal(result.isError, false, JSON.stringify(result));
+    assert.match(result.content[0].text as string, /client-beat-done/);
+  });
+
+  it("sends no progress without a progress token, and a failed send does not fail the run", async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const base = makeTmpBase();
+    t.after(() => cleanup(base));
+    const server = makeMockServer();
+    registerWorkflowTools(server as any);
+    const tool = server.tools.find((x) => x.name === "gsd_exec");
+    assert.ok(tool, "exec tool should be registered");
+
+    let unasked = 0;
+    const silent = tool!.handler(
+      { projectDir: base, runtime: "node", script: "setTimeout(() => console.log('quiet-done'), 300);", timeout_ms: 10_000 },
+      { _meta: {}, sendNotification: async () => { unasked += 1; } } as any,
+    );
+    await delay(100);
+    t.mock.timers.tick(EXEC_PROGRESS_INTERVAL_MS * 2);
+    assert.match(((await silent) as any).content[0].text as string, /quiet-done/);
+    assert.equal(unasked, 0, "no progress unless the client asked for it");
+
+    let attempts = 0;
+    const failing = tool!.handler(
+      { projectDir: base, runtime: "node", script: "setTimeout(() => console.log('still-done'), 300);", timeout_ms: 10_000 },
+      {
+        _meta: { progressToken: 7 },
+        sendNotification: async () => {
+          attempts += 1;
+          throw new Error("transport closed");
+        },
+      } as any,
+    );
+    await delay(100);
+    t.mock.timers.tick(EXEC_PROGRESS_INTERVAL_MS);
+    await delay(0);
+    const record = (await failing) as any;
+    assert.equal(attempts, 1);
+    assert.equal(record.isError, false);
+    assert.match(record.content[0].text as string, /still-done/);
+  });
+
+  it("allows a 60-minute timeout_ms on gsd_exec and gsd_uat_exec, matching the gsd extension's clamp", () => {
+    // The gsd extension's EXEC_CLAMP_TIMEOUT_MS (constants.ts) pins the same value in exec-sandbox.test.ts.
+    assert.equal(EXEC_CLAMP_TIMEOUT_MS, 3_600_000);
+    const server = makeMockServer();
+    registerWorkflowTools(server as any);
+    for (const name of ["gsd_exec", "gsd_uat_exec"]) {
+      const tool = server.tools.find((t) => t.name === name);
+      assert.ok(tool, `${name} should be registered`);
+      const timeout = (tool as any).params.timeout_ms;
+      assert.equal(timeout.safeParse(EXEC_CLAMP_TIMEOUT_MS).success, true, `${name} accepts the clamp`);
+      assert.equal(timeout.safeParse(EXEC_CLAMP_TIMEOUT_MS + 1).success, false, `${name} rejects above the clamp`);
     }
   });
 });

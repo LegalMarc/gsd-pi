@@ -1333,6 +1333,7 @@ interface WorkflowMcpRequestExtra {
   requestId?: string | number;
   sessionId?: string;
   _meta?: Record<string, unknown>;
+  sendNotification?: (notification: unknown) => void | Promise<void>;
 }
 
 interface McpToolServer {
@@ -1460,6 +1461,47 @@ export const WORKFLOW_TOOL_ALIAS_NAMES = CONTRACT_WORKFLOW_TOOL_ALIAS_NAMES;
 const WORKFLOW_TOOL_ALIAS_NAME_SET = new Set<string>(CONTRACT_WORKFLOW_TOOL_ALIAS_NAMES);
 
 const DEFAULT_WORKFLOW_OP_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * Upper bound for one gsd_exec / gsd_uat_exec call (60 minutes). Equal to
+ * EXEC_CLAMP_TIMEOUT_MS in src/resources/extensions/gsd/constants.ts. Those
+ * two tools run their command outside the workflow operation queue, so this
+ * bound never holds the queue or meets the per-operation deadline.
+ */
+export const EXEC_CLAMP_TIMEOUT_MS = 3_600_000;
+/**
+ * How often gsd_exec / gsd_uat_exec send an MCP progress notification while
+ * their command runs. An MCP client may end a call that shows neither a result
+ * nor progress for a while, and that can be shorter than the exec clamp:
+ * Claude Code ends a stdio MCP call after 30 minutes of silence
+ * (CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT). Each notification resets that.
+ */
+export const EXEC_PROGRESS_INTERVAL_MS = 60_000;
+
+/**
+ * Sends `notifications/progress` every EXEC_PROGRESS_INTERVAL_MS until the
+ * returned function is called. It sends nothing unless the client asked for
+ * progress on this request (`_meta.progressToken`) and the request can send
+ * notifications. A failed send is ignored: the command's result is what counts.
+ */
+function startExecProgress(toolName: string, extra?: WorkflowMcpRequestExtra): () => void {
+  const progressToken = extra?._meta?.progressToken;
+  const send = extra?.sendNotification;
+  if ((typeof progressToken !== "string" && typeof progressToken !== "number") || typeof send !== "function") {
+    return () => {};
+  }
+  const startedAt = Date.now();
+  let progress = 0;
+  const timer = setInterval(() => {
+    progress += 1;
+    const minutes = Math.floor((Date.now() - startedAt) / 60_000);
+    const params = { progressToken, progress, message: `${toolName} still running (${minutes} min)` };
+    void Promise.resolve()
+      .then(() => send({ method: "notifications/progress", params }))
+      .catch(() => {});
+  }, EXEC_PROGRESS_INTERVAL_MS);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
 
 function getWorkflowOpTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.GSD_MCP_WORKFLOW_TIMEOUT_MS?.trim();
@@ -3109,7 +3151,7 @@ const execParams = {
   cmd: z.string().optional().describe("Short alias for script."),
   code: z.string().optional().describe("Alias for script, useful for node/python snippets."),
   purpose: z.string().optional().describe("Short label recorded in meta.json for later review."),
-  timeout_ms: z.number().int().min(1_000).max(600_000).optional().describe("Per-invocation timeout in milliseconds."),
+  timeout_ms: z.number().int().min(1_000).max(EXEC_CLAMP_TIMEOUT_MS).optional().describe("Per-invocation timeout in milliseconds (at most 60 minutes)."),
 };
 const execSchema = z.object(execParams);
 
@@ -3134,7 +3176,7 @@ const uatExecParams = {
   cmd: z.string().optional().describe("Short alias for script."),
   code: z.string().optional().describe("Alias for script, useful for node/python snippets."),
   expected: z.string().optional().describe("Expected outcome for this UAT check."),
-  timeout_ms: z.number().int().min(1_000).max(600_000).optional().describe("Per-invocation timeout in milliseconds."),
+  timeout_ms: z.number().int().min(1_000).max(EXEC_CLAMP_TIMEOUT_MS).optional().describe("Per-invocation timeout in milliseconds (at most 60 minutes)."),
 };
 const uatExecSchema = z.object(uatExecParams);
 
@@ -4409,21 +4451,28 @@ export function registerWorkflowTools(
     "gsd_uat_exec",
     "Run one UAT-scoped bash/node/python check with milestone/slice/check metadata. Evidence persists under .gsd/exec with kind=uat_exec.",
     uatExecParams,
-    async (args: Record<string, unknown>, extra?: { signal?: AbortSignal }) => {
-      const { projectDir, ...params } = parseWorkflowArgs(uatExecSchema, args);
-      await enforceWorkflowWriteGate("gsd_uat_exec", projectDir);
-      const { executeUatExec } = await importLocalModule<any>(
-        "../../../src/resources/extensions/gsd/tools/exec-tool.js",
-      );
-      return adaptExecutorResult(
-        await runSerializedWorkflowOperation(async () =>
-          executeUatExec(params, {
+    async (args: Record<string, unknown>, extra?: WorkflowMcpRequestExtra) => {
+      // The command runs outside the workflow queue (it may run for up to the
+      // exec clamp); only its write gate and host-record write join the queue.
+      // Progress notifications keep the client from ending a long, silent call.
+      const stopProgress = startExecProgress("gsd_uat_exec", extra);
+      try {
+        const { projectDir, ...params } = parseWorkflowArgs(uatExecSchema, args);
+        await enforceWorkflowWriteGate("gsd_uat_exec", projectDir);
+        const { executeUatExec } = await importLocalModule<any>(
+          "../../../src/resources/extensions/gsd/tools/exec-tool.js",
+        );
+        return adaptExecutorResult(
+          await executeUatExec(params, {
             baseDir: projectDir,
             preferences: await loadProjectPreferences(projectDir),
             signal: extra?.signal,
+            serializeRecord: (fn: () => Promise<unknown>) => runSerializedWorkflowOperation(fn),
           }),
-        ),
-      );
+        );
+      } finally {
+        stopProgress();
+      }
     },
   );
 
@@ -4431,21 +4480,28 @@ export function registerWorkflowTools(
     "gsd_exec",
     "Run a short bash/node/python script in the project directory. Capped stdout/stderr and metadata persist under .gsd/exec; only a digest returns to MCP.",
     execParams,
-    async (args: Record<string, unknown>, extra?: { signal?: AbortSignal }) => {
-      const { projectDir, ...params } = parseWorkflowArgs(execSchema, args);
-      await enforceWorkflowWriteGate("gsd_exec", projectDir);
-      const { executeGsdExec } = await importLocalModule<any>(
-        "../../../src/resources/extensions/gsd/tools/exec-tool.js",
-      );
-      return adaptExecutorResult(
-        await runSerializedWorkflowOperation(async () =>
-          executeGsdExec(params, {
+    async (args: Record<string, unknown>, extra?: WorkflowMcpRequestExtra) => {
+      // The command runs outside the workflow queue (it may run for up to the
+      // exec clamp); only its write gate and host-record write join the queue.
+      // Progress notifications keep the client from ending a long, silent call.
+      const stopProgress = startExecProgress("gsd_exec", extra);
+      try {
+        const { projectDir, ...params } = parseWorkflowArgs(execSchema, args);
+        await enforceWorkflowWriteGate("gsd_exec", projectDir);
+        const { executeGsdExec } = await importLocalModule<any>(
+          "../../../src/resources/extensions/gsd/tools/exec-tool.js",
+        );
+        return adaptExecutorResult(
+          await executeGsdExec(params, {
             baseDir: projectDir,
             preferences: await loadProjectPreferences(projectDir),
             signal: extra?.signal,
+            serializeRecord: (fn: () => Promise<unknown>) => runSerializedWorkflowOperation(fn),
           }),
-        ),
-      );
+        );
+      } finally {
+        stopProgress();
+      }
     },
   );
 

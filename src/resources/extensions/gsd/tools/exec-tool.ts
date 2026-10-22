@@ -17,7 +17,7 @@ import {
 } from "../preferences-types.js";
 import { bashReferencesProjectRootOutsideWorktree } from "../worktree-shell-guard.js";
 import { openExistingWorkflowDatabase } from "../db-workspace.js";
-import { recordExecRun } from "../db/writers/exec-runs.js";
+import { currentExecAttemptRef, recordExecRun } from "../db/writers/exec-runs.js";
 import { loadEffectiveGSDPreferences } from "../preferences.js";
 import { redactSecrets } from "../redact-secrets.js";
 import { readSourceRevisionForRecord } from "../verification-source-integrity.js";
@@ -43,6 +43,14 @@ export interface ExecToolDeps {
   now?: () => Date;
   generateId?: () => string;
   signal?: AbortSignal;
+  /**
+   * Runs the host-record steps: reading the caller's Attempt before the
+   * command, and writing the run after it. The workflow MCP server passes its
+   * operation queue here, so only those short DB steps are serialized with
+   * other workflow operations, never the command itself, which can run for
+   * up to the exec clamp.
+   */
+  serializeRecord?: <T>(fn: () => Promise<T>) => Promise<T>;
 }
 
 type ExecToolPreferences = Pick<GSDPreferences, "context_mode" | "verification_timeout_ms">;
@@ -238,6 +246,28 @@ interface UatExecBinding {
 }
 
 /**
+ * The Attempt the run's caller has as the command starts. A run is bound to an
+ * Attempt only if it is still the caller's Attempt when the run is stored, so
+ * an Attempt saved, settled or replaced while a long command ran never gets
+ * that run as evidence. `null` when there is none or it cannot be read: the
+ * run is then stored unbound. `undefined` when there is no workflow database,
+ * so nothing will be stored.
+ */
+function readAttemptRefAtStart(baseDir: string, uat: UatExecBinding | undefined): string | null | undefined {
+  try {
+    const opened = openExistingWorkflowDatabase(baseDir);
+    if (!opened.ok) {
+      return opened.reason === "missing-gsd-dir" || opened.reason === "missing-database" ? undefined : null;
+    }
+    return currentExecAttemptRef(
+      uat ? { kind: "uat_exec", cwd: baseDir, milestoneId: uat.milestoneId, sliceId: uat.sliceId } : { kind: "exec", cwd: baseDir },
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Store the run as an exec_runs row. Evidence checks read that row, so a run
  * outside a GSD project (no workflow database) is not evidence of anything.
  * Returns the reason when a project database exists and the run is not stored.
@@ -248,6 +278,7 @@ function recordRun(
   script: string,
   startedAt: Date,
   uat: UatExecBinding | undefined,
+  attemptRefAtStart: string | null | undefined,
 ): string | null {
   try {
     const opened = openExistingWorkflowDatabase(baseDir);
@@ -255,7 +286,8 @@ function recordRun(
       if (opened.reason === "missing-gsd-dir" || opened.reason === "missing-database") return null;
       return opened.error?.message ?? `workflow database ${opened.reason}`;
     }
-    storeRun(baseDir, result, script, startedAt, uat);
+    // A database that appeared during the command had no Attempt to read at its start.
+    storeRun(baseDir, result, script, startedAt, uat, attemptRefAtStart === undefined ? null : attemptRefAtStart);
     return null;
   } catch (err) {
     return err instanceof Error ? err.message : String(err);
@@ -268,6 +300,7 @@ function storeRun(
   script: string,
   startedAt: Date,
   uat: UatExecBinding | undefined,
+  attemptRefAtStart: string | null,
 ): void {
   const hash = createHash("sha256");
   for (const path of [result.stdout_path, result.stderr_path]) hash.update(readFileSync(path));
@@ -283,6 +316,7 @@ function storeRun(
     started_at: startedAt.toISOString(),
     duration_ms: result.duration_ms,
     output_hash: `sha256:${hash.digest("hex")}`,
+    attemptRefAtStart,
     // Only a UAT run stores the source revision: reading it hashes every source file.
     ...(uat
       ? {
@@ -321,6 +355,14 @@ export async function executeGsdExec(
     isVerificationWorkload(params, script),
   );
   const run = deps.run ?? runExecSandbox;
+  const serialize = <T>(fn: () => Promise<T>): Promise<T> => (deps.serializeRecord ? deps.serializeRecord(fn) : fn());
+
+  let attemptRefAtStart: string | null | undefined;
+  try {
+    attemptRefAtStart = await serialize(async () => readAttemptRefAtStart(deps.baseDir, uat));
+  } catch {
+    attemptRefAtStart = null;
+  }
 
   const startedAt = (deps.now ?? (() => new Date()))();
   let result: ExecSandboxResult;
@@ -344,16 +386,34 @@ export async function executeGsdExec(
     };
   }
   const formatted = formatResult(result, typeof params.purpose === "string" ? params.purpose : undefined);
-  const notRecorded = recordRun(deps.baseDir, result, script, startedAt, uat);
+  let notRecorded: string | null;
+  let recordUnknown = false;
+  try {
+    notRecorded = await serialize(async () => recordRun(deps.baseDir, result, script, startedAt, uat, attemptRefAtStart));
+  } catch (err) {
+    // The command ran: a failed record step is reported as a warning, never as
+    // a failed run. recordRun reports its own errors, so this is the queue
+    // failing around it, and whether the row was written is not known.
+    notRecorded = err instanceof Error ? err.message : String(err);
+    recordUnknown = true;
+  }
   if (notRecorded === null) return formatted;
+  const warning = recordUnknown
+    ? `The command ran, but the host may not have recorded this run: ${notRecorded}. ` +
+      "Do not count it as verification or UAT evidence unless a later check finds it recorded."
+    : `The command ran, but the host did not record this run: ${notRecorded}. ` +
+      "This run is not verification or UAT evidence.";
   return {
     ...formatted,
     content: [{
       type: "text",
-      text: `${formatted.content[0]!.text}\n--- warning ---\nThe command ran, but the host did not record this run: ${notRecorded}. ` +
-        "This run is not verification or UAT evidence. Do not run the command again only to get the output.",
+      text: `${formatted.content[0]!.text}\n--- warning ---\n${warning} Do not run the command again only to get the output.`,
     }],
-    details: { ...formatted.details, run_not_recorded: notRecorded },
+    details: {
+      ...formatted.details,
+      run_not_recorded: notRecorded,
+      ...(recordUnknown ? { run_record_outcome: "unknown" } : {}),
+    },
   };
 }
 

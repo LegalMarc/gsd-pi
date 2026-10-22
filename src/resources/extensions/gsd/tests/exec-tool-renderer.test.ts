@@ -265,6 +265,27 @@ test("gsd_exec renderResult surfaces run_not_recorded from structured details on
 	assert.ok(warned.includes("workflow database locked"), `warning reason missing: ${warned}`);
 });
 
+test("gsd_exec renderResult says a record is unknown, not missing, when the record step's outcome is unknown", () => {
+	const tool = getTool("gsd_exec");
+	const unknown = successResult(
+		{
+			operation: "gsd_exec",
+			exit_code: 0,
+			stdout_bytes: 12,
+			stderr_bytes: 0,
+			stdout_path: ".gsd/exec/exec-1.stdout",
+			stderr_path: ".gsd/exec/exec-1.stderr",
+			digest: "check passed",
+			run_not_recorded: "workflow queue failed",
+			run_record_outcome: "unknown",
+		},
+	);
+	const text = renderText(tool.renderResult(unknown, {}, fakeTheme));
+	assert.ok(text.includes("record unknown"), `unknown record missing: ${text}`);
+	assert.ok(text.includes("workflow queue failed"), `warning reason missing: ${text}`);
+	assert.ok(!text.includes("not recorded"), `unknown record shown as missing: ${text}`);
+});
+
 test("gsd_exec renderResult keeps genuine warning visibility for legacy rows without details", () => {
 	const tool = getTool("gsd_exec");
 	const legacyText =

@@ -23,7 +23,7 @@ const INTERACTIVE_TOOLS = new Set(["ask_user_questions", "secure_env_collect"]);
 /**
  * Coordination and bounded execution tools that can legitimately run until
  * their child work or own timeout finishes. Execution bounds per tool:
- * gsd_exec/gsd_uat_exec — exec sandbox clamp (600s); async_bash — returns a
+ * gsd_exec/gsd_uat_exec — exec sandbox clamp (60 min); async_bash — returns a
  * job ID immediately; await_job — resolves at its own wait timeout;
  * bg_shell — action-based with bounded per-action timeouts. The idle watchdog
  * must leave these to the unit-level hard timeout.

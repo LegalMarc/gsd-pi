@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { getShellConfig } from '@gsd/pi-coding-agent';
 import { closeDatabase, openDatabase } from '../gsd-db.ts';
 import { EXEC_DEFAULTS, runExecSandbox, type ExecSandboxOptions } from '../exec-sandbox.ts';
+import { EXEC_CLAMP_TIMEOUT_MS } from '../constants.ts';
 import { buildExecOptions, executeGsdExec } from '../tools/exec-tool.ts';
 import { isContextModeEnabled } from '../preferences-types.ts';
 import { validatePreferences } from '../preferences-validation.ts';
@@ -476,7 +477,7 @@ test('validatePreferences: rejects invalid context_mode preference values', () =
   } as any);
   assert.ok(result.errors.length > 0);
   assert.ok(result.errors.includes('context_mode.enabled must be a boolean'));
-  assert.ok(result.errors.includes('context_mode.exec_timeout_ms must be a number between 1000 and 600000'));
+  assert.ok(result.errors.includes('context_mode.exec_timeout_ms must be a number between 1000 and 3600000'));
   assert.ok(result.errors.includes('context_mode.exec_stdout_cap_bytes must be a number between 4096 and 16777216'));
   assert.ok(result.errors.includes('context_mode.exec_digest_chars must be a number between 0 and 4000'));
   assert.ok(result.errors.includes('context_mode.exec_env_allowlist must be an array of valid env var names'));
@@ -506,6 +507,22 @@ test('buildExecOptions: defaults to verification timeout and honors exec overrid
     context_mode: { enabled: true, exec_timeout_ms: 234_567 },
   });
   assert.equal(overridden.default_timeout_ms, 234_567);
+});
+
+test('gsd_exec allows a 60-minute command: sandbox cap, preference bounds and the inherited verification timeout agree', () => {
+  assert.equal(EXEC_DEFAULTS.clampTimeoutMs, 3_600_000);
+  assert.equal(EXEC_DEFAULTS.clampTimeoutMs, EXEC_CLAMP_TIMEOUT_MS);
+
+  // A 25-minute verification gate, set through verification_timeout_ms, is no longer cut to 10 minutes.
+  const inherited = buildExecOptions('/tmp/base', { verification_timeout_ms: 1_500_000, context_mode: { enabled: true } });
+  assert.equal(inherited.default_timeout_ms, 1_500_000);
+  assert.equal(inherited.clamp_timeout_ms, 3_600_000);
+
+  const atCap = validatePreferences({ context_mode: { exec_timeout_ms: 3_600_000 } } as any);
+  assert.equal(atCap.errors.length, 0);
+  assert.equal(atCap.preferences.context_mode?.exec_timeout_ms, 3_600_000);
+  const overCap = validatePreferences({ context_mode: { exec_timeout_ms: 3_600_001 } } as any);
+  assert.ok(overCap.errors.includes('context_mode.exec_timeout_ms must be a number between 1000 and 3600000'));
 });
 
 test('buildExecOptions: clamps out-of-range values to safe defaults', () => {

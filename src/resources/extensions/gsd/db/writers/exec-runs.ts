@@ -30,11 +30,28 @@ export interface ExecRunRow {
 
 export type ExecRunInput =
   & Pick<ExecRunRow, "id" | "runtime" | "command" | "cwd" | "exit_code" | "signal" | "started_at" | "duration_ms" | "output_hash">
-  & { timedOut: boolean; aborted: boolean }
+  & {
+    timedOut: boolean;
+    aborted: boolean;
+    /**
+     * The Attempt the run's caller had when the command started
+     * (currentExecAttemptRef, read before the command). When given, the run is
+     * bound only if its Attempt is still that one when the run is stored; an
+     * Attempt that was saved, settled or replaced while the command ran leaves
+     * the run unbound. `null` (no Attempt, or it could not be read) leaves it
+     * unbound too.
+     */
+    attemptRefAtStart?: string | null;
+  }
   & (
     | { kind: "exec" }
     | { kind: "uat_exec"; milestoneId: string; sliceId: string; checkId: string; sourceRevision?: string | null }
   );
+
+/** What a run's Attempt is read from: its kind, folder and, for UAT, its Slice. */
+export type ExecAttemptScope =
+  | { kind: "exec"; cwd: string }
+  | { kind: "uat_exec"; cwd: string; milestoneId: string; sliceId: string };
 
 /** Identity of one run-uat attempt. It is also the run id of the saved UAT result. */
 export function uatAttemptRef(milestoneId: string, sliceId: string, attempt: number): string {
@@ -56,7 +73,9 @@ function callerScopeOf(cwd: string): string {
 }
 
 /**
- * The Attempt a run belongs to, read in the transaction that stores the run.
+ * The Attempt a run belongs to. It is read before the command starts
+ * (currentExecAttemptRef) and again in the transaction that stores the run;
+ * the run is bound only when both reads agree.
  * A UAT run belongs to the run-uat attempt that is not saved yet. Another run
  * belongs to the Task Attempt of its caller that is not settled. The caller is
  * known by the scope of its worker: `<MID>` for a Milestone, `<MID>-<SID>` for
@@ -66,7 +85,7 @@ function callerScopeOf(cwd: string): string {
  * With no such Attempt, or with more than one, the run is unbound and proves
  * nothing.
  */
-function currentAttemptRef(input: ExecRunInput): string | null {
+function currentAttemptRef(input: ExecAttemptScope): string | null {
   if (input.kind === "uat_exec") {
     const row = getDb().prepare(`
       SELECT MAX(attempt) AS attempt
@@ -96,9 +115,15 @@ function currentAttemptRef(input: ExecRunInput): string | null {
   return open.length === 1 ? String(open[0]!["attempt_id"]) : null;
 }
 
+/** The Attempt a run started now would belong to (see currentAttemptRef). */
+export function currentExecAttemptRef(scope: ExecAttemptScope): string | null {
+  return currentAttemptRef(scope);
+}
+
 export function recordExecRun(input: ExecRunInput): ExecRunRow {
   return transaction(() => {
     const uat = input.kind === "uat_exec" ? input : null;
+    const attemptRef = currentAttemptRef(input);
     const row: ExecRunRow = {
       id: input.id,
       kind: input.kind,
@@ -115,7 +140,7 @@ export function recordExecRun(input: ExecRunInput): ExecRunRow {
       milestone_id: uat?.milestoneId ?? null,
       slice_id: uat?.sliceId ?? null,
       check_id: uat?.checkId ?? null,
-      attempt_ref: currentAttemptRef(input),
+      attempt_ref: input.attemptRefAtStart === undefined || input.attemptRefAtStart === attemptRef ? attemptRef : null,
       source_revision: uat?.sourceRevision ?? null,
     };
     const columns = Object.keys(row);

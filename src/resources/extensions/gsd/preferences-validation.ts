@@ -11,6 +11,7 @@ import type { PostUnitHookConfig, PreDispatchHookConfig, TokenProfile, PhaseSkip
 import type { DynamicRoutingConfig } from "./model-router.js";
 import { isAbsolute, posix, win32 } from "node:path";
 import { VALID_BRANCH_NAME } from "./git-service.js";
+import { EXEC_CLAMP_TIMEOUT_MS } from "./constants.js";
 import { normalizeStringArray } from "../shared/format-utils.js";
 import { getGateIdsForTurn } from "./gate-registry.js";
 
@@ -1191,8 +1192,8 @@ export function validatePreferences(preferences: GSDPreferences): {
       }
       if (cmode.exec_timeout_ms !== undefined) {
         const t = cmode.exec_timeout_ms;
-        if (typeof t === "number" && t >= 1000 && t <= 600_000) validCmode.exec_timeout_ms = Math.floor(t);
-        else errors.push("context_mode.exec_timeout_ms must be a number between 1000 and 600000");
+        if (typeof t === "number" && t >= 1000 && t <= EXEC_CLAMP_TIMEOUT_MS) validCmode.exec_timeout_ms = Math.floor(t);
+        else errors.push(`context_mode.exec_timeout_ms must be a number between 1000 and ${EXEC_CLAMP_TIMEOUT_MS}`);
       }
       if (cmode.exec_stdout_cap_bytes !== undefined) {
         const b = cmode.exec_stdout_cap_bytes;

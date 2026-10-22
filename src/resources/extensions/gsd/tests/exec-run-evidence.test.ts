@@ -145,6 +145,44 @@ describe("host exec runs are database rows", () => {
 
     assert.equal(readExecRun(await uatExec("S01", "printf ok"))?.attempt_ref, "uat:M001:S01:attempt-2");
   });
+
+  test("a run whose run-uat attempt is saved while its command runs is stored unbound", async () => {
+    const result = await executeUatExec(
+      { milestoneId: "M001", sliceId: "S01", checkId: "UAT-01", intent: "uat-runtime-check", script: "printf ok" },
+      {
+        baseDir: base,
+        preferences: null,
+        run: async (request, options) => {
+          const ran = await runExecSandbox(request, options);
+          // Attempt 1 is saved (gsd_uat_result_save) before this run is stored.
+          saveUatAttempt("S01", 1);
+          return ran;
+        },
+      },
+    );
+    const run = readExecRun(String(result.details?.id));
+    assert.equal(run?.exit_code, 0);
+    // Not bound to attempt 1 (already saved) nor to attempt 2 (started after the command).
+    assert.equal(run?.attempt_ref, null);
+  });
+
+  test("a run whose run-uat attempt is unchanged while its command runs is bound to it", async () => {
+    saveUatAttempt("S01", 1);
+    const result = await executeUatExec(
+      { milestoneId: "M001", sliceId: "S01", checkId: "UAT-01", intent: "uat-runtime-check", script: "printf ok" },
+      {
+        baseDir: base,
+        preferences: null,
+        run: async (request, options) => {
+          const ran = await runExecSandbox(request, options);
+          // Another slice's attempt is not this run's.
+          saveUatAttempt("S02", 1);
+          return ran;
+        },
+      },
+    );
+    assert.equal(readExecRun(String(result.details?.id))?.attempt_ref, "uat:M001:S01:attempt-2");
+  });
 });
 
 describe("UAT runs are bound to the source revision", () => {
