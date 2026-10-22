@@ -619,7 +619,7 @@ Long-running coordination tools (`subagent` and its `Task` alias) and bounded ex
 tools (`gsd_exec`, `gsd_uat_exec`, `async_bash`, `await_job`, and `bg_shell`) are exempt
 from `stalled_tool_timeout_minutes`, including their MCP-prefixed names. These calls
 can legitimately outlast the stalled-tool budget. Execution tools retain their own
-limits: `gsd_exec` and `gsd_uat_exec` use the 600-second exec sandbox clamp;
+limits: `gsd_exec` and `gsd_uat_exec` use the 60-minute exec sandbox clamp;
 `async_bash` returns a job ID immediately; `await_job` has its own wait timeout;
 and `bg_shell` has bounded per-action timeouts. All exempt tools remain subject to
 `hard_timeout_minutes` and do not re-arm that timeout. Other non-interactive tools
@@ -731,7 +731,7 @@ For missing-command handling and the task-evidence exception, see [Auto Mode —
 
 Verification commands must be simple executable commands. Shell piping (`|`) is supported, but logical OR (`||`) is rejected. GSD also rejects redirects (`>` and `<`), semicolons, backticks, and command substitution (`$(...)`) because verification is run as a controlled command list, not as an arbitrary shell program.
 
-For `gsd_exec`, verification-oriented workloads include builds, tests, linting, type checks, and verification commands. An explicit `context_mode.exec_timeout_ms` takes precedence over `verification_timeout_ms`; unrelated `gsd_exec` workloads keep the sandbox's 30-second default when `context_mode.exec_timeout_ms` is unset.
+For `gsd_exec`, verification-oriented workloads include builds, tests, linting, type checks, and verification commands. An explicit `context_mode.exec_timeout_ms` takes precedence over `verification_timeout_ms`; unrelated `gsd_exec` workloads keep the sandbox's 30-second default when `context_mode.exec_timeout_ms` is unset. A single `gsd_exec` call runs for at most 60 minutes (`3600000` ms), so a full verification gate can run in the foreground; a larger timeout is clamped to that. Over the workflow MCP server the command runs outside the workflow operation queue, so `GSD_MCP_WORKFLOW_TIMEOUT_MS` bounds only its record write and other workflow calls are not held behind it; GSD's own MCP client waits at least the clamp plus a minute for these two tools (a longer `GSD_MCP_WORKFLOW_TIMEOUT_MS` is kept, `0` disables the wait). Claude Code's MCP client has its own per-call limit (`MCP_TOOL_TIMEOUT`). The unit itself stays bounded by `auto_supervisor.hard_timeout_minutes` (default 30, scaled by the task's estimate): raise it when a task's gate comes close to that.
 
 For task-level `verify` commands (`taskPlanVerify`), GSD splits checks on newlines. `<item>...</item>` wrappers around commands are treated as separators, not shell syntax. `&&` chains stay within a single shell invocation, so commands such as `cd path && npm test` preserve directory context. If a task names verify commands but every one is rejected as shell-unsafe (unquoted redirects, `;`, `$(...)`, backticks), GSD does not fall back to preference or `package.json` checks; the task fails with a `task-plan-unsafe` discovery source and asks you to rewrite the Verify field.
 

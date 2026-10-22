@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { getShellConfig, killProcessTree, SIGKILL_GRACE_MS, HARD_DEADLINE_MS } from "@gsd/pi-coding-agent";
-import { DEFAULT_COMMAND_TIMEOUT_MS } from "./constants.js";
+import { DEFAULT_COMMAND_TIMEOUT_MS, EXEC_CLAMP_TIMEOUT_MS } from "./constants.js";
 import { redactSecrets } from "./redact-secrets.js";
 
 export interface ExecSandboxRequest {
@@ -106,7 +106,9 @@ const ALWAYS_FORWARD_ENV = ["PATH", "HOME"] as const;
 // so this sandbox can never drift from the canonical kill path it delegates to.
 
 export const EXEC_DEFAULTS = {
-  clampTimeoutMs: 600_000,
+  // A 10-minute cap pushed executors to start a long verification gate
+  // detached and poll it, outside the unit's process tree and its timeouts.
+  clampTimeoutMs: EXEC_CLAMP_TIMEOUT_MS,
   defaultTimeoutMs: DEFAULT_COMMAND_TIMEOUT_MS,
   stdoutCapBytes: 1_048_576,
   stderrCapBytes: 262_144,

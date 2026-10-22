@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { registerExecTools } from "../bootstrap/exec-tools.ts";
 import { executeGsdExec, executeUatExec } from "../tools/exec-tool.ts";
-import type { ExecSandboxOptions, ExecSandboxRequest, ExecSandboxResult } from "../exec-sandbox.ts";
+import { EXEC_DEFAULTS, type ExecSandboxOptions, type ExecSandboxRequest, type ExecSandboxResult } from "../exec-sandbox.ts";
 
 function makeExecResult(request: ExecSandboxRequest): ExecSandboxResult {
   return {
@@ -185,6 +185,64 @@ test("gsd_exec surfaces a force-resolved (D-state) kill distinctly from a clean 
   assert.equal(result.details?.force_resolved, true, "details must expose force_resolved");
   const text = result.content.map((c) => c.text ?? "").join("\n");
   assert.match(text, /exit=timeout\(force-killed\)/, "summary must distinguish a force-killed result");
+});
+
+test("executeGsdExec runs the command first, then hands only the record step to serializeRecord", async () => {
+  const events: string[] = [];
+  const result = await executeGsdExec(
+    { runtime: "bash", script: "echo hi" },
+    {
+      baseDir: "/tmp/gsd-exec-serialize-record-no-project",
+      preferences: null,
+      run: async (request) => {
+        events.push("run");
+        return makeExecResult(request);
+      },
+      serializeRecord: async (fn) => {
+        events.push("record-start");
+        const value = await fn();
+        events.push("record-end");
+        return value;
+      },
+    },
+  );
+  assert.equal(result.isError, false);
+  assert.deepEqual(events, ["run", "record-start", "record-end"]);
+});
+
+test("executeGsdExec keeps the run's result when the serialized record step fails", async () => {
+  const result = await executeGsdExec(
+    { runtime: "bash", script: "echo hi" },
+    {
+      baseDir: "/tmp/gsd-exec-serialize-record-no-project",
+      preferences: null,
+      run: async (request) => makeExecResult(request),
+      serializeRecord: async () => {
+        throw new Error("Workflow operation exceeded 5000ms deadline (GSD_MCP_WORKFLOW_TIMEOUT_MS)");
+      },
+    },
+  );
+  assert.equal(result.isError, false);
+  assert.match(result.content[0]!.text, /exit=0/);
+  assert.match(result.content[0]!.text, /did not record this run/);
+  assert.match(String(result.details?.run_not_recorded), /exceeded 5000ms deadline/);
+});
+
+test("registerExecTools: the timeout_ms schema of gsd_exec and gsd_uat_exec allows what the sandbox allows", () => {
+  const tools: Array<{ name: string; parameters: any }> = [];
+  registerExecTools({
+    registerTool: (tool: { name: string; parameters: any }) => {
+      tools.push(tool);
+    },
+  } as any);
+
+  for (const name of ["gsd_exec", "gsd_uat_exec"]) {
+    const tool = tools.find((registeredTool) => registeredTool.name === name);
+    assert.ok(tool, `${name} should be registered`);
+    const timeout = tool.parameters.properties.timeout_ms;
+    assert.equal(timeout.maximum, EXEC_DEFAULTS.clampTimeoutMs, `${name} schema maximum matches the sandbox cap`);
+    assert.ok(timeout.description.includes(`Capped at ${EXEC_DEFAULTS.clampTimeoutMs} `), `${name} description names the cap`);
+  }
 });
 
 test("registerExecTools exposes gsd_uat_exec intent as recoverable string schema", () => {

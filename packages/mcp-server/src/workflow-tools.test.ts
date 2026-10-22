@@ -50,6 +50,7 @@ import {
   _parseWorkflowArgsForTest,
   _summarySaveSchemaForTest,
   _runSerializedWorkflowOperationForTest,
+  EXEC_CLAMP_TIMEOUT_MS,
   _sliceCompleteSchemaForTest,
 } from "./workflow-tools.ts";
 
@@ -492,6 +493,58 @@ describe("runSerializedWorkflowOperation", () => {
       } else {
         process.env.GSD_MCP_WORKFLOW_TIMEOUT_MS = previousTimeout;
       }
+    }
+  });
+});
+
+describe("workflow MCP exec and the operation queue", () => {
+  it("runs a gsd_exec command outside the workflow queue and past the operation deadline", async () => {
+    const previousTimeout = process.env.GSD_MCP_WORKFLOW_TIMEOUT_MS;
+    const base = makeTmpBase();
+    try {
+      process.env.GSD_MCP_WORKFLOW_TIMEOUT_MS = "100";
+      const server = makeMockServer();
+      registerWorkflowTools(server as any);
+      const tool = server.tools.find((t) => t.name === "gsd_exec");
+      assert.ok(tool, "exec tool should be registered");
+
+      let execDone = false;
+      const exec = tool!.handler({
+        projectDir: base,
+        runtime: "node",
+        script: "setTimeout(() => console.log('slow-exec-done'), 400);",
+        timeout_ms: 10_000,
+      }).then((result) => {
+        execDone = true;
+        return result as any;
+      });
+      await delay(50);
+      // Another workflow operation is not queued behind the running command.
+      assert.equal(await _runSerializedWorkflowOperationForTest(async () => "other"), "other");
+      assert.equal(execDone, false, "the command is still running");
+
+      // The command outlives the 100 ms operation deadline and still returns its own result.
+      const record = await exec;
+      assert.equal(record.isError, false);
+      assert.match(record.content[0].text as string, /slow-exec-done/);
+    } finally {
+      if (previousTimeout === undefined) delete process.env.GSD_MCP_WORKFLOW_TIMEOUT_MS;
+      else process.env.GSD_MCP_WORKFLOW_TIMEOUT_MS = previousTimeout;
+      cleanup(base);
+    }
+  });
+
+  it("allows a 60-minute timeout_ms on gsd_exec and gsd_uat_exec, matching the gsd extension's clamp", () => {
+    // The gsd extension's EXEC_CLAMP_TIMEOUT_MS (constants.ts) pins the same value in exec-sandbox.test.ts.
+    assert.equal(EXEC_CLAMP_TIMEOUT_MS, 3_600_000);
+    const server = makeMockServer();
+    registerWorkflowTools(server as any);
+    for (const name of ["gsd_exec", "gsd_uat_exec"]) {
+      const tool = server.tools.find((t) => t.name === name);
+      assert.ok(tool, `${name} should be registered`);
+      const timeout = (tool as any).params.timeout_ms;
+      assert.equal(timeout.safeParse(EXEC_CLAMP_TIMEOUT_MS).success, true, `${name} accepts the clamp`);
+      assert.equal(timeout.safeParse(EXEC_CLAMP_TIMEOUT_MS + 1).success, false, `${name} rejects above the clamp`);
     }
   });
 });

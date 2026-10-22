@@ -43,6 +43,13 @@ export interface ExecToolDeps {
   now?: () => Date;
   generateId?: () => string;
   signal?: AbortSignal;
+  /**
+   * Runs the host-record step (the workflow DB write). The workflow MCP server
+   * passes its operation queue here, so only the write is serialized with
+   * other workflow operations, never the command itself, which can run for
+   * up to the exec clamp.
+   */
+  serializeRecord?: <T>(fn: () => Promise<T>) => Promise<T>;
 }
 
 type ExecToolPreferences = Pick<GSDPreferences, "context_mode" | "verification_timeout_ms">;
@@ -344,7 +351,15 @@ export async function executeGsdExec(
     };
   }
   const formatted = formatResult(result, typeof params.purpose === "string" ? params.purpose : undefined);
-  const notRecorded = recordRun(deps.baseDir, result, script, startedAt, uat);
+  const record = async () => recordRun(deps.baseDir, result, script, startedAt, uat);
+  let notRecorded: string | null;
+  try {
+    notRecorded = deps.serializeRecord ? await deps.serializeRecord(record) : await record();
+  } catch (err) {
+    // The command ran: a failed record step (for example the workflow queue's
+    // deadline) is reported as "not recorded", never as a failed run.
+    notRecorded = err instanceof Error ? err.message : String(err);
+  }
   if (notRecorded === null) return formatted;
   return {
     ...formatted,

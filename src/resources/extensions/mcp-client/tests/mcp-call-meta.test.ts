@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import mcpClientExtension, { _resetMcpClientStateForTest } from "../index.js";
+import mcpClientExtension, { _mcpCallTimeoutMsForTest, _resetMcpClientStateForTest } from "../index.js";
 
 function createMockPi(): { pi: unknown; tools: Map<string, any> } {
 	const tools = new Map<string, any>();
@@ -98,6 +98,23 @@ test("mcp_call CallTool request params include replay-stable _meta (#1792)", asy
 		rmSync(projectDir, { recursive: true, force: true });
 		rmSync(gsdHomeDir, { recursive: true, force: true });
 	}
+});
+
+test("mcp_call gives the workflow server's gsd_exec and gsd_uat_exec the exec clamp plus a minute", () => {
+	const execDeadline = 3_600_000 + 60_000;
+	for (const tool of ["gsd_exec", "gsd_uat_exec"]) {
+		assert.equal(_mcpCallTimeoutMsForTest("gsd-workflow", {}, tool), execDeadline, `${tool} default`);
+		assert.equal(_mcpCallTimeoutMsForTest("gsd-workflow", { GSD_MCP_WORKFLOW_TIMEOUT_MS: "100" }, tool), execDeadline);
+		assert.equal(
+			_mcpCallTimeoutMsForTest("gsd-workflow", { GSD_MCP_WORKFLOW_TIMEOUT_MS: "7200000" }, tool),
+			7_200_000,
+			"a longer configured deadline is kept",
+		);
+		assert.equal(_mcpCallTimeoutMsForTest("gsd-workflow", { GSD_MCP_WORKFLOW_TIMEOUT_MS: "0" }, tool), 2_147_483_647);
+		assert.equal(_mcpCallTimeoutMsForTest("other", {}, tool), 60_000, "other servers keep the plain MCP timeout");
+	}
+	assert.equal(_mcpCallTimeoutMsForTest("gsd-workflow", {}, "gsd_plan_slice"), 5 * 60 * 1000);
+	assert.equal(_mcpCallTimeoutMsForTest("gsd-workflow", { GSD_MCP_WORKFLOW_TIMEOUT_MS: "100" }, "gsd_plan_slice"), 100);
 });
 
 test("mcp_call uses the workflow server timeout only for the gsd-workflow server", async () => {

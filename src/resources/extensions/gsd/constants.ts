@@ -8,6 +8,13 @@
 
 /** Default timeout for verification-gate commands (ms). */
 export const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
+/**
+ * Upper bound for one gsd_exec / gsd_uat_exec call (60 minutes). A project's
+ * full verification gate can take 20-30 minutes; host verification
+ * (verification_timeout_ms) has no such cap. Mirrored as a literal in the
+ * workflow MCP server's schemas and deadlines; tests keep them equal.
+ */
+export const EXEC_CLAMP_TIMEOUT_MS = 3_600_000;
 
 // ─── Cache Sizes ──────────────────────────────────────────────────────────────
 

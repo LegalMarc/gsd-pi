@@ -1460,6 +1460,13 @@ export const WORKFLOW_TOOL_ALIAS_NAMES = CONTRACT_WORKFLOW_TOOL_ALIAS_NAMES;
 const WORKFLOW_TOOL_ALIAS_NAME_SET = new Set<string>(CONTRACT_WORKFLOW_TOOL_ALIAS_NAMES);
 
 const DEFAULT_WORKFLOW_OP_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * Upper bound for one gsd_exec / gsd_uat_exec call (60 minutes). Equal to
+ * EXEC_CLAMP_TIMEOUT_MS in src/resources/extensions/gsd/constants.ts. Those
+ * two tools run their command outside the workflow operation queue, so this
+ * bound never holds the queue or meets the per-operation deadline.
+ */
+export const EXEC_CLAMP_TIMEOUT_MS = 3_600_000;
 
 function getWorkflowOpTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.GSD_MCP_WORKFLOW_TIMEOUT_MS?.trim();
@@ -3109,7 +3116,7 @@ const execParams = {
   cmd: z.string().optional().describe("Short alias for script."),
   code: z.string().optional().describe("Alias for script, useful for node/python snippets."),
   purpose: z.string().optional().describe("Short label recorded in meta.json for later review."),
-  timeout_ms: z.number().int().min(1_000).max(600_000).optional().describe("Per-invocation timeout in milliseconds."),
+  timeout_ms: z.number().int().min(1_000).max(EXEC_CLAMP_TIMEOUT_MS).optional().describe("Per-invocation timeout in milliseconds (at most 60 minutes)."),
 };
 const execSchema = z.object(execParams);
 
@@ -3134,7 +3141,7 @@ const uatExecParams = {
   cmd: z.string().optional().describe("Short alias for script."),
   code: z.string().optional().describe("Alias for script, useful for node/python snippets."),
   expected: z.string().optional().describe("Expected outcome for this UAT check."),
-  timeout_ms: z.number().int().min(1_000).max(600_000).optional().describe("Per-invocation timeout in milliseconds."),
+  timeout_ms: z.number().int().min(1_000).max(EXEC_CLAMP_TIMEOUT_MS).optional().describe("Per-invocation timeout in milliseconds (at most 60 minutes)."),
 };
 const uatExecSchema = z.object(uatExecParams);
 
@@ -4415,14 +4422,15 @@ export function registerWorkflowTools(
       const { executeUatExec } = await importLocalModule<any>(
         "../../../src/resources/extensions/gsd/tools/exec-tool.js",
       );
+      // The command runs outside the workflow queue (it may run for up to the
+      // exec clamp); only its host-record write joins the queue.
       return adaptExecutorResult(
-        await runSerializedWorkflowOperation(async () =>
-          executeUatExec(params, {
-            baseDir: projectDir,
-            preferences: await loadProjectPreferences(projectDir),
-            signal: extra?.signal,
-          }),
-        ),
+        await executeUatExec(params, {
+          baseDir: projectDir,
+          preferences: await loadProjectPreferences(projectDir),
+          signal: extra?.signal,
+          serializeRecord: (fn: () => Promise<unknown>) => runSerializedWorkflowOperation(fn),
+        }),
       );
     },
   );
@@ -4437,14 +4445,15 @@ export function registerWorkflowTools(
       const { executeGsdExec } = await importLocalModule<any>(
         "../../../src/resources/extensions/gsd/tools/exec-tool.js",
       );
+      // The command runs outside the workflow queue (it may run for up to the
+      // exec clamp); only its host-record write joins the queue.
       return adaptExecutorResult(
-        await runSerializedWorkflowOperation(async () =>
-          executeGsdExec(params, {
-            baseDir: projectDir,
-            preferences: await loadProjectPreferences(projectDir),
-            signal: extra?.signal,
-          }),
-        ),
+        await executeGsdExec(params, {
+          baseDir: projectDir,
+          preferences: await loadProjectPreferences(projectDir),
+          signal: extra?.signal,
+          serializeRecord: (fn: () => Promise<unknown>) => runSerializedWorkflowOperation(fn),
+        }),
       );
     },
   );

@@ -9,6 +9,7 @@ import { Type } from "@sinclair/typebox";
 import type { ExtensionAPI } from "@gsd/pi-coding-agent";
 
 import { resolveCtxCwd } from "./dynamic-tools.js";
+import { EXEC_CLAMP_TIMEOUT_MS } from "../constants.js";
 import { renderExecCall, renderExecResult, renderUatExecCall } from "../tools/exec-tool-renderer.js";
 
 
@@ -61,9 +62,9 @@ export function registerExecTools(pi: ExtensionAPI): void {
       expected: Type.Optional(Type.String({ description: "Expected outcome for this UAT check." })),
       timeout_ms: Type.Optional(
         Type.Number({
-          description: "Per-invocation timeout (ms). Capped at 600000. Default from preferences.",
+          description: `Per-invocation timeout (ms). Capped at ${EXEC_CLAMP_TIMEOUT_MS} (60 minutes). Default from preferences.`,
           minimum: 1_000,
-          maximum: 600_000,
+          maximum: EXEC_CLAMP_TIMEOUT_MS,
         }),
       ),
     }),
@@ -122,9 +123,9 @@ export function registerExecTools(pi: ExtensionAPI): void {
       ),
       timeout_ms: Type.Optional(
         Type.Number({
-          description: "Per-invocation timeout (ms). Capped at 600000. Default from preferences.",
+          description: `Per-invocation timeout (ms). Capped at ${EXEC_CLAMP_TIMEOUT_MS} (60 minutes). Default from preferences.`,
           minimum: 1_000,
-          maximum: 600_000,
+          maximum: EXEC_CLAMP_TIMEOUT_MS,
         }),
       ),
     }),
