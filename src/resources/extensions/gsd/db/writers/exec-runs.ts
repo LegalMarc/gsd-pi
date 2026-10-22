@@ -26,6 +26,7 @@ export interface ExecRunRow {
   check_id: string | null;
   attempt_ref: string | null;
   source_revision: string | null;
+  run_contract: string | null;
 }
 
 export type ExecRunInput =
@@ -44,7 +45,7 @@ export type ExecRunInput =
     attemptRefAtStart?: string | null;
   }
   & (
-    | { kind: "exec" }
+    | { kind: "exec"; sourceRevision?: string | null; runContract?: string | null }
     | { kind: "uat_exec"; milestoneId: string; sliceId: string; checkId: string; sourceRevision?: string | null }
   );
 
@@ -115,6 +116,31 @@ function currentAttemptRef(input: ExecAttemptScope): string | null {
   return open.length === 1 ? String(open[0]!["attempt_id"]) : null;
 }
 
+/**
+ * The Task whose open Attempt a gsd_exec run started now in `cwd` would belong
+ * to (the same rule as currentAttemptRef), or null when there is none or more
+ * than one.
+ */
+export function currentExecTask(cwd: string): { attemptId: string; milestoneId: string; sliceId: string; taskId: string } | null {
+  const attemptId = currentAttemptRef({ kind: "exec", cwd });
+  if (!attemptId) return null;
+  const row = getDb().prepare(`
+    SELECT lifecycle.milestone_id, lifecycle.slice_id, lifecycle.task_id
+    FROM workflow_execution_attempts attempt
+    JOIN workflow_item_lifecycles lifecycle
+      ON lifecycle.lifecycle_id = attempt.lifecycle_id
+     AND lifecycle.project_id = attempt.project_id
+    WHERE attempt.attempt_id = :attempt_id
+  `).get({ ":attempt_id": attemptId });
+  if (row == null || !row["slice_id"] || !row["task_id"]) return null;
+  return {
+    attemptId,
+    milestoneId: String(row["milestone_id"]),
+    sliceId: String(row["slice_id"]),
+    taskId: String(row["task_id"]),
+  };
+}
+
 /** The Attempt a run started now would belong to (see currentAttemptRef). */
 export function currentExecAttemptRef(scope: ExecAttemptScope): string | null {
   return currentAttemptRef(scope);
@@ -141,7 +167,8 @@ export function recordExecRun(input: ExecRunInput): ExecRunRow {
       slice_id: uat?.sliceId ?? null,
       check_id: uat?.checkId ?? null,
       attempt_ref: input.attemptRefAtStart === undefined || input.attemptRefAtStart === attemptRef ? attemptRef : null,
-      source_revision: uat?.sourceRevision ?? null,
+      source_revision: input.sourceRevision ?? null,
+      run_contract: input.kind === "exec" ? input.runContract ?? null : null,
     };
     const columns = Object.keys(row);
     getDb().prepare(

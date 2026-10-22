@@ -6,7 +6,8 @@ import type { DbAdapter } from "./db-adapter.js";
 import { columnExists, ensureColumn } from "./db-schema-metadata.js";
 
 export function hasExecRunSchema(db: DbAdapter): boolean {
-  return columnExists(db, "exec_runs", "source_revision");
+  // Every column recordExecRun writes: a database missing one is repaired on open.
+  return columnExists(db, "exec_runs", "source_revision") && columnExists(db, "exec_runs", "run_contract");
 }
 
 /**
@@ -15,8 +16,13 @@ export function hasExecRunSchema(db: DbAdapter): boolean {
  * Operations, like gate_runs. `.gsd/exec/<id>.*` holds the output text and a
  * metadata copy for gsd_exec_search; that copy is not evidence.
  * `source_revision` is the project source revision when a gsd_uat_exec run
- * was recorded. It is NULL for a gsd_exec run and when the source cannot be
- * read.
+ * was recorded, or, for a gsd_exec run started with the host gate's run
+ * contract (verification_reuse_exec_evidence), the revision read before and
+ * after the command when the two agreed. It is NULL otherwise and when the
+ * source cannot be read.
+ * `run_contract` is that gate run contract (verificationCommandInvocation):
+ * a digest of the program, argv, folder and whole environment the command ran
+ * with. NULL for every other run.
  * Idempotent.
  */
 export function createExecRunSchema(db: DbAdapter): void {
@@ -38,9 +44,11 @@ export function createExecRunSchema(db: DbAdapter): void {
       slice_id TEXT,
       check_id TEXT,
       attempt_ref TEXT,
-      source_revision TEXT
+      source_revision TEXT,
+      run_contract TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_exec_runs_attempt ON exec_runs(attempt_ref);
   `);
   ensureColumn(db, "exec_runs", "source_revision", "ALTER TABLE exec_runs ADD COLUMN source_revision TEXT");
+  ensureColumn(db, "exec_runs", "run_contract", "ALTER TABLE exec_runs ADD COLUMN run_contract TEXT");
 }

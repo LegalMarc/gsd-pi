@@ -23,6 +23,8 @@ export interface EvidenceCheckJSON {
   failureClass?: "timeout" | "command-not-found" | "shell-parse";
   stdoutExcerpt?: string;
   stderrExcerpt?: string;
+  /** The host-recorded gsd_exec run this check was taken from, when the gate reused one. */
+  reusedExecRunId?: string;
 }
 
 /** Maximum bytes retained for each stdout/stderr excerpt in VERIFY.json. */
@@ -145,6 +147,7 @@ export function evidenceChecks(result: VerificationResult): EvidenceCheckJSON[] 
       ...(check.failureClass ? { failureClass: check.failureClass } : {}),
       ...(stdoutExcerpt !== undefined ? { stdoutExcerpt } : {}),
       ...(stderrExcerpt !== undefined ? { stderrExcerpt } : {}),
+      ...(check.reusedExecRun ? { reusedExecRunId: check.reusedExecRun.id } : {}),
     };
   });
 }

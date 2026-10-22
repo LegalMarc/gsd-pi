@@ -25,10 +25,12 @@ import { claimTestDispatch } from "./helpers/unit-dispatch.ts";
 import { readStoredUnitRetry } from "../db/unit-dispatch-retries.ts";
 import { openDatabase, closeDatabase, insertMilestone, insertSlice, insertTask, getTaskVerificationEvidence, _getAdapter } from "../gsd-db.ts";
 import { readExecRun, recordExecRun } from "../db/writers/exec-runs.ts";
+import { executeGsdExec } from "../tools/exec-tool.ts";
+import { loadEffectiveGSDPreferences } from "../preferences.ts";
 import { invalidateAllCaches } from "../cache.ts";
 import { _clearGsdRootCache } from "../paths.ts";
 import { initMetrics, resetMetrics } from "../metrics.ts";
-import { captureVerificationSourceSnapshot } from "../verification-source-integrity.ts";
+import { captureMilestoneVerificationSourceRevision, captureVerificationSourceSnapshot } from "../verification-source-integrity.ts";
 import { _setDomainOperationFaultForTest, executeDomainOperation } from "../db/domain-operation.ts";
 import {
   adoptOrTransitionLifecycle,
@@ -247,6 +249,18 @@ function createCanonicalSucceededTaskAttempt(
   claimedCommands: string[] = [],
   retryOfAttemptId?: string,
 ): string {
+  const claimed = claimCanonicalTaskAttempt(milestoneId, sliceId, retryOfAttemptId);
+  whileRunning();
+  claimed.settle(claimedCommands);
+  return claimed.attemptId;
+}
+
+/** Claim a Task Attempt as the dispatcher does; `settle` settles it as succeeded, as the executor's completion does. */
+function claimCanonicalTaskAttempt(
+  milestoneId = "M001",
+  sliceId = "S01",
+  retryOfAttemptId?: string,
+): { attemptId: string; settle: (claimedCommands?: string[]) => void } {
   const unit = `${milestoneId}-${sliceId}${retryOfAttemptId ? "-retry" : ""}`;
   const adapter = _getAdapter();
   assert.ok(adapter);
@@ -317,8 +331,7 @@ function createCanonicalSucceededTaskAttempt(
     coordinationDispatchId: dispatch.id,
     ...(retryOfAttemptId ? { retryOfAttemptId } : {}),
   });
-  whileRunning();
-  settleTaskAttempt({
+  const settle = (claimedCommands: string[] = []) => settleTaskAttempt({
     invocation: internalExecutionInvocation(`fixture/verification-task-settle/${unit}`),
     attemptId: claimed.attemptId,
     outcome: "succeeded",
@@ -342,7 +355,7 @@ function createCanonicalSucceededTaskAttempt(
       },
     } : {}),
   });
-  return claimed.attemptId;
+  return { attemptId: claimed.attemptId, settle };
 }
 
 function createTaskWithoutVerify(status = "pending"): void {
@@ -1785,4 +1798,186 @@ describe("Post-execution retry behavior", () => {
     assert.equal(pauseAutoMock.mock.callCount(), 0);
     assert.equal(s.pendingVerificationRetry?.unitId, "M001/S01/T01");
   });
+});
+
+describe("verification_reuse_exec_evidence: the gate takes the executor's gsd_exec run only under its own run contract", () => {
+  // The Verify command appends a line to .gsd/runs.log (outside the hashed
+  // source) each time it really runs, so a test can count gate runs.
+  const COUNT = "node .gsd/count.cjs";
+  let savedProbe: string | undefined;
+
+  beforeEach(() => {
+    setupTestEnvironment();
+    savedProbe = process.env.GSD_REUSE_TEST_PROBE;
+    delete process.env.GSD_REUSE_TEST_PROBE;
+    writeFileSync(
+      join(tempDir, ".gsd", "count.cjs"),
+      [
+        'const { appendFileSync } = require("node:fs");',
+        'appendFileSync(require("node:path").join(__dirname, "runs.log"), "run\\n");',
+        'process.exit(process.env.GSD_REUSE_TEST_PROBE === "fail" ? 1 : 0);',
+      ].join("\n"),
+    );
+    writeFileSync(join(tempDir, "app.js"), "export const answer = 42;\n");
+    execFileSync("git", ["add", "app.js"], { cwd: tempDir });
+    execFileSync("git", ["commit", "-qm", "app"], { cwd: tempDir });
+  });
+
+  afterEach(() => {
+    if (savedProbe === undefined) delete process.env.GSD_REUSE_TEST_PROBE;
+    else process.env.GSD_REUSE_TEST_PROBE = savedProbe;
+    cleanupTestEnvironment();
+  });
+
+  const runCount = () => {
+    const path = join(tempDir, ".gsd", "runs.log");
+    return existsSync(path) ? readFileSync(path, "utf-8").split("\n").filter(Boolean).length : 0;
+  };
+
+  /** The executor runs `script` through gsd_exec inside the open Attempt, then completes. */
+  async function executorRuns(scripts: string[], betweenRunAndSettle: () => void = () => {}, gateHost = true, runtime = "bash") {
+    const claimed = claimCanonicalTaskAttempt();
+    const ids: string[] = [];
+    for (const script of scripts) {
+      const result = await executeGsdExec(
+        { runtime, script, purpose: "verify" },
+        { baseDir: tempDir, preferences: loadEffectiveGSDPreferences(tempDir)?.preferences ?? null, gateHost },
+      );
+      ids.push(String(result.details?.id));
+    }
+    betweenRunAndSettle();
+    claimed.settle();
+    return { attemptId: claimed.attemptId, ids };
+  }
+
+  async function hostVerification(attemptId: string) {
+    const s = makeMockSession(tempDir, { type: "execute-task", id: "M001/S01/T01" });
+    const result = await runPostUnitVerification(
+      { s, ctx: makeMockCtx(), pi: makeMockPi() } satisfies VerificationContext,
+      mock.fn(async () => {}),
+    );
+    const evidence = _getAdapter()!.prepare(
+      "SELECT started_at, ended_at, environment_json FROM workflow_verification_evidence WHERE attempt_id = ? ORDER BY created_at DESC LIMIT 1",
+    ).get(attemptId) as { started_at: string; ended_at: string; environment_json: string } | undefined;
+    return { result, verdict: readTaskTechnicalVerdict(attemptId)?.verdict, evidence };
+  }
+
+  test("a passing run with the gate's contract on the tested source stands in for the gate, and the record names it", async () => {
+    createBasicTask(COUNT);
+    writePreferences({ verification_reuse_exec_evidence: true });
+    const { attemptId, ids } = await executorRuns([COUNT]);
+    assert.equal(runCount(), 1);
+    const row = readExecRun(ids[0]!);
+    assert.equal(row?.attempt_ref, attemptId);
+    assert.match(row?.run_contract ?? "", /^run-contract:v1:sha256:[0-9a-f]{64}$/);
+    assert.equal(row?.source_revision, currentSourceRevisionOfRoot());
+
+    const outcome = await hostVerification(attemptId);
+    assert.equal(outcome.verdict, "pass");
+    assert.equal(runCount(), 1, "the gate did not run the command again");
+    const environment = JSON.parse(outcome.evidence!.environment_json);
+    assert.deepEqual(environment.reusedExecRuns.map((run: { id: string }) => run.id), [ids[0]]);
+    assert.equal(environment.checks[0].reusedExecRunId, ids[0]);
+    assert.equal(outcome.evidence!.started_at, row!.started_at, "the verdict window starts at the run's own start");
+    assert.equal(Date.parse(outcome.evidence!.ended_at), Date.parse(row!.started_at) + row!.duration_ms);
+  });
+
+  test("with the preference off, gsd_exec runs sandboxed and the gate runs the command again", async () => {
+    createBasicTask(COUNT);
+    const { attemptId, ids } = await executorRuns([COUNT]);
+    assert.equal(readExecRun(ids[0]!)?.run_contract, null);
+    assert.equal(readExecRun(ids[0]!)?.source_revision, null);
+    assert.equal((await hostVerification(attemptId)).verdict, "pass");
+    assert.equal(runCount(), 2);
+  });
+
+  test("a pipeline whose first stage fails is red in gsd_exec as in the gate (pipefail), so nothing passes falsely", async () => {
+    const piped = `${COUNT} | cat`;
+    createBasicTask(piped);
+    writePreferences({ verification_reuse_exec_evidence: true });
+    process.env.GSD_REUSE_TEST_PROBE = "fail";
+    const { attemptId, ids } = await executorRuns([piped]);
+    assert.notEqual(readExecRun(ids[0]!)?.exit_code, 0, "the gate's shell fails the pipeline");
+    assert.notEqual((await hostVerification(attemptId)).verdict, "pass");
+    assert.equal(runCount(), 2, "the gate ran the command itself");
+  });
+
+  test("a different environment at gate time is another contract: the gate runs", async () => {
+    createBasicTask(COUNT);
+    writePreferences({ verification_reuse_exec_evidence: true });
+    const { attemptId } = await executorRuns([COUNT], () => {
+      process.env.GSD_REUSE_TEST_PROBE = "changed";
+    });
+    assert.equal((await hostVerification(attemptId)).verdict, "pass");
+    assert.equal(runCount(), 2);
+  });
+
+  test("an edit after the run changes the source revision: the gate runs", async () => {
+    createBasicTask(COUNT);
+    writePreferences({ verification_reuse_exec_evidence: true });
+    const { attemptId } = await executorRuns([COUNT], () => {
+      writeFileSync(join(tempDir, "app.js"), "export const answer = 43;\n");
+    });
+    await hostVerification(attemptId);
+    assert.equal(runCount(), 2);
+  });
+
+  test("a newer failed run blocks an older passing one", async () => {
+    createBasicTask(COUNT);
+    writePreferences({ verification_reuse_exec_evidence: true });
+    const claimed = claimCanonicalTaskAttempt();
+    const prefs = loadEffectiveGSDPreferences(tempDir)?.preferences ?? null;
+    await executeGsdExec({ runtime: "bash", script: COUNT }, { baseDir: tempDir, preferences: prefs, gateHost: true });
+    // Same contract needs the same environment, so fail through the file the command reads.
+    writeFileSync(join(tempDir, ".gsd", "count.cjs"), 'require("node:fs").appendFileSync(require("node:path").join(__dirname, "runs.log"), "run\\n"); process.exit(1);');
+    await executeGsdExec({ runtime: "bash", script: COUNT }, { baseDir: tempDir, preferences: prefs, gateHost: true });
+    claimed.settle();
+    assert.equal(runCount(), 2);
+    assert.notEqual((await hostVerification(claimed.attemptId)).verdict, "pass");
+    assert.equal(runCount(), 3, "the gate ran the command itself");
+  });
+
+  test("a script that is not one of the Task's Verify commands runs sandboxed, with no contract", async () => {
+    createBasicTask(COUNT);
+    writePreferences({ verification_reuse_exec_evidence: true });
+    const { attemptId, ids } = await executorRuns([`${COUNT} && true`]);
+    assert.equal(readExecRun(ids[0]!)?.run_contract, null);
+    await hostVerification(attemptId);
+    assert.equal(runCount(), 2);
+  });
+
+  test("outside the gate's process (the workflow MCP server passes no gateHost) a Verify-command run stays sandboxed and is not reused", async () => {
+    createBasicTask(COUNT);
+    writePreferences({ verification_reuse_exec_evidence: true });
+    const { attemptId, ids } = await executorRuns([COUNT], () => {}, false);
+    assert.equal(readExecRun(ids[0]!)?.run_contract, null);
+    assert.equal(readExecRun(ids[0]!)?.source_revision, null);
+    await hostVerification(attemptId);
+    assert.equal(runCount(), 2);
+  });
+
+  test("a node runtime run of the Verify text gets no contract", async () => {
+    createBasicTask(COUNT);
+    writePreferences({ verification_reuse_exec_evidence: true });
+    const { attemptId, ids } = await executorRuns([COUNT], () => {}, true, "node");
+    // The claim is the null contract: the Verify text is not valid JavaScript, so this run fails whatever happens.
+    assert.equal(readExecRun(ids[0]!)?.run_contract, null);
+    await hostVerification(attemptId);
+    assert.equal(runCount(), 1, "the gate ran the command itself");
+  });
+
+  test("a run longer than verification_timeout_ms is not reused", async () => {
+    createBasicTask(COUNT);
+    writePreferences({ verification_reuse_exec_evidence: true, verification_timeout_ms: 1_000 });
+    const { attemptId, ids } = await executorRuns([COUNT]);
+    _getAdapter()!.prepare("UPDATE exec_runs SET duration_ms = 1000 WHERE id = ?").run(ids[0]!);
+    await hostVerification(attemptId);
+    assert.equal(runCount(), 2);
+  });
+
+  function currentSourceRevisionOfRoot(): string {
+    const captured = captureMilestoneVerificationSourceRevision(tempDir, loadEffectiveGSDPreferences(tempDir)?.preferences);
+    assert.equal(captured.ok, true);
+    return (captured as { sourceRevision: string }).sourceRevision;
+  }
 });

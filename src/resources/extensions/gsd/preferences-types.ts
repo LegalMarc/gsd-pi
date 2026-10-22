@@ -201,6 +201,7 @@ export const KNOWN_PREFERENCE_KEYS = new Set<string>([
   "verification_auto_fix",
   "verification_max_retries",
   "verification_timeout_ms",
+  "verification_reuse_exec_evidence",
   "verification_source_exclude_paths",
   "per_unit_cost_cap_usd",
   "unit_cost_spike_multiplier",
@@ -647,6 +648,15 @@ export interface GSDPreferences {
   verification_max_retries?: number;
   /** Per-command host-verification and verification-oriented gsd_exec timeout in ms. Unset host verification uses 120000. */
   verification_timeout_ms?: number;
+  /**
+   * Let the host verification gate reuse the Task Attempt's own gsd_exec runs
+   * of the discovered commands instead of running them again. A run counts only
+   * when it was started with the gate's own run contract (program, argv,
+   * folder and whole environment; see verificationCommandInvocation), succeeded
+   * on exactly the source revision under test, and took less than
+   * verification_timeout_ms. Default: false.
+   */
+  verification_reuse_exec_evidence?: boolean;
   /**
    * Git pathspecs excluded from the verification source-revision snapshot
    * (#2873). Each entry becomes a `:(exclude)<entry>` pathspec on every

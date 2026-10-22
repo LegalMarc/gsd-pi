@@ -1982,7 +1982,7 @@ export function serializePreferencesToFrontmatter(prefs: Record<string, unknown>
     "phases", "parallel", "slice_parallel",
     "reactive_execution", "gate_evaluation",
     "auto_visualize", "auto_report",
-    "verification_commands", "verification_auto_fix", "verification_max_retries",
+    "verification_commands", "verification_auto_fix", "verification_max_retries", "verification_reuse_exec_evidence",
     "verification_source_exclude_paths",
     "per_unit_cost_cap_usd",
     "enhanced_verification", "enhanced_verification_pre",

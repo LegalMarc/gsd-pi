@@ -90,6 +90,11 @@ export interface VerificationCheck {
   durationMs: number;
   /** Infrastructure/execution faults that prevented the command from producing a requirement verdict. */
   failureClass?: "timeout" | "command-not-found" | "shell-parse";
+  /**
+   * Set when the check was not run by the gate but taken from a host-recorded
+   * gsd_exec run with the gate's own run contract (verification_reuse_exec_evidence).
+   */
+  reusedExecRun?: { id: string; startedAt: string; durationMs: number; outputHash: string };
 }
 
 /** A runtime error captured from bg-shell processes or browser console */

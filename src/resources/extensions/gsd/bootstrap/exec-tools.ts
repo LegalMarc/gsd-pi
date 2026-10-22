@@ -142,6 +142,8 @@ export function registerExecTools(pi: ExtensionAPI): void {
         baseDir,
         preferences: await loadContextModePreferences(baseDir),
         signal: _signal,
+        // This tool runs in the process that runs host verification.
+        gateHost: true,
       });
     },
   });

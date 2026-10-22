@@ -4,6 +4,7 @@
 // First non-empty source wins.
 
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -1522,6 +1523,181 @@ function spawnVerificationCommand(
 }
 
 /**
+ * The shell and final command text for one authored (rtk-rewritten) Verify
+ * command. Route on the authored text, then format the injected venv
+ * interpreter for that shell — a native `D:\...\python.exe` must not drag a
+ * POSIX `python -c '...'` check onto cmd, where its quotes would be literal.
+ */
+function shellCommandFor(
+  hostShell: VerificationShell,
+  authoredCommand: string,
+  cwd: string,
+): { shell: VerificationShell; rewrittenCommand: string } {
+  const shell = shellForCommand(hostShell, authoredCommand);
+  const pythonNormalized = normalizePythonCommand(
+    authoredCommand,
+    cwd,
+    shell.kind === "git-bash" ? "posix" : "native",
+  );
+  // The `.\app\pnpm.cmd` rewrite is cmd-only; bash runs `app/pnpm.cmd` as is.
+  const rewrittenCommand = shell.kind === "cmd"
+    ? normalizeWindowsPackageManagerCommand(pythonNormalized)
+    : pythonNormalized;
+  return { shell, rewrittenCommand };
+}
+
+/**
+ * Exactly how the host gate would start one Verify command in `cwd`: program,
+ * argv and environment, built by the gate's own steps (environment, shell
+ * choice, rtk rewrite, python normalization). `contract` is a digest of all of
+ * them, so two runs with equal contracts ran the same program, flags, command
+ * text, folder and environment. Null where the gate does not run the command
+ * as a plain argv (Git Bash runs it from a temp script file, cmd re-parses it):
+ * no contract there, so nothing is reused.
+ */
+export interface VerificationCommandInvocation {
+  bin: string;
+  args: string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  contract: string;
+}
+
+export function verificationCommandInvocation(
+  command: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv = verificationChildEnvironment(cwd),
+): VerificationCommandInvocation | null {
+  return invocationForAuthoredCommand(rewriteCommandWithRtk(command), cwd, env, resolveVerificationShell(env));
+}
+
+/** verificationCommandInvocation for a command already through the rtk rewrite. */
+function invocationForAuthoredCommand(
+  authoredCommand: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  hostShell: VerificationShell,
+): VerificationCommandInvocation | null {
+  if (hostShell.kind !== "posix") return null;
+  const { shell, rewrittenCommand } = shellCommandFor(hostShell, authoredCommand, cwd);
+  if (shell.kind !== "posix") return null;
+  const args = shell.argsFor(rewrittenCommand);
+  return { bin: shell.bin, args, cwd, env, contract: verificationRunContract(shell.bin, args, cwd, env) };
+}
+
+/** Digest of a run's program, argv, folder and whole environment (every variable and value, sorted). */
+export function verificationRunContract(bin: string, args: readonly string[], cwd: string, env: NodeJS.ProcessEnv): string {
+  const entries = Object.entries(env)
+    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return `run-contract:v1:sha256:${createHash("sha256").update(JSON.stringify([bin, args, cwd, entries])).digest("hex")}`;
+}
+
+/** A gsd_exec run of the Attempt under verification, as reuse reads it. */
+export interface ReusableExecRun {
+  id: string;
+  /** verificationCommandInvocation's contract when the run was started with it, else null. */
+  runContract: string | null;
+  /** The verification source revision, read before and after the run and kept only when equal. */
+  sourceRevision: string | null;
+  /** Exit 0 and no signal, timeout or abort. */
+  succeeded: boolean;
+  startedAt: string;
+  durationMs: number;
+  outputHash: string;
+}
+
+export type ReuseDecision =
+  | { reused: true; checks: VerificationCheck[] }
+  | { reused: false; reason: string };
+
+/**
+ * The gate's checks for `commands` from runs already recorded in the Attempt,
+ * or why not. For each command, the newest run with the gate's own contract
+ * for it decides: it must have succeeded, on exactly `sourceRevision`, in less
+ * time than the gate's per-command limit. Any command without such a run, or
+ * without a contract, means none is reused and the gate runs them all.
+ */
+export function decideVerificationReuse(
+  commands: readonly string[],
+  contractFor: (command: string) => string | null,
+  sourceRevision: string,
+  commandTimeoutMs: number,
+  runs: readonly ReusableExecRun[],
+): ReuseDecision {
+  if (commands.length === 0) return { reused: false, reason: "no runnable commands" };
+  if (!sourceRevision.startsWith("sha256:")) return { reused: false, reason: "source revision unknown" };
+  const checks: VerificationCheck[] = [];
+  for (const command of commands) {
+    const contract = contractFor(command);
+    if (!contract) return { reused: false, reason: `no run contract for ${command} on this host` };
+    let newest: ReusableExecRun | undefined;
+    for (const run of runs) {
+      if (run.runContract !== contract) continue;
+      if (!newest || run.startedAt > newest.startedAt || (run.startedAt === newest.startedAt && run.id > newest.id)) {
+        newest = run;
+      }
+    }
+    if (!newest) return { reused: false, reason: `no gsd_exec run of ${command} with the gate's shell and environment` };
+    if (!newest.succeeded) return { reused: false, reason: `the latest run of ${command} (${newest.id}) did not succeed` };
+    if (newest.sourceRevision !== sourceRevision) {
+      return { reused: false, reason: `the latest run of ${command} (${newest.id}) ran on another or unknown source revision` };
+    }
+    if (!(newest.durationMs < commandTimeoutMs)) {
+      return { reused: false, reason: `the latest run of ${command} (${newest.id}) took longer than verification_timeout_ms` };
+    }
+    checks.push({
+      command,
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+      durationMs: newest.durationMs,
+      reusedExecRun: {
+        id: newest.id,
+        startedAt: newest.startedAt,
+        durationMs: newest.durationMs,
+        outputHash: newest.outputHash,
+      },
+    });
+  }
+  return { reused: true, checks };
+}
+
+/**
+ * The gate's result from the Attempt's own gsd_exec runs
+ * (verification_reuse_exec_evidence), or why the gate must run. Discovery is
+ * the gate's own, with the same options.
+ */
+export function reuseRecordedVerification(
+  options: RunVerificationGateOptions & { sourceRevision: string; runs: readonly ReusableExecRun[] },
+): { result: VerificationResult; reason?: undefined } | { result: null; reason: string } {
+  const { commands, source } = discoverCommands({
+    preferenceCommands: options.preferenceCommands,
+    taskPlanVerify: options.taskPlanVerify,
+    ...(options.taskEvidence ? { taskEvidence: options.taskEvidence } : {}),
+    cwd: options.cwd,
+  });
+  const env = verificationChildEnvironment(options.cwd);
+  const decision = decideVerificationReuse(
+    commands,
+    (command) => verificationCommandInvocation(command, options.cwd, env)?.contract ?? null,
+    options.sourceRevision,
+    options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
+    options.runs,
+  );
+  if (!decision.reused) return { result: null, reason: decision.reason };
+  const starts = decision.checks.map((check) => Date.parse(check.reusedExecRun!.startedAt));
+  return {
+    result: {
+      passed: true,
+      checks: decision.checks,
+      discoverySource: source,
+      timestamp: Math.min(...starts),
+    },
+  };
+}
+
+/**
  * Run the verification gate: discover commands, execute each as a child
  * process, and return a structured result.
  *
@@ -1579,24 +1755,20 @@ export async function runVerificationGate(options: RunVerificationGateOptions): 
       });
       continue;
     }
-    // Route on the authored text, then format the injected venv interpreter
-    // for that shell — a native `D:\...\python.exe` must not drag a POSIX
-    // `python -c '...'` check onto cmd, where its quotes would be literal.
-    const shell = shellForCommand(hostShell, authoredCommand);
-    const pythonNormalized = normalizePythonCommand(
-      authoredCommand,
-      options.cwd,
-      shell.kind === "git-bash" ? "posix" : "native",
-    );
-    // The `.\app\pnpm.cmd` rewrite is cmd-only; bash runs `app/pnpm.cmd` as is.
-    const rewrittenCommand = shell.kind === "cmd"
-      ? normalizeWindowsPackageManagerCommand(pythonNormalized)
-      : pythonNormalized;
+    const { shell, rewrittenCommand } = shellCommandFor(hostShell, authoredCommand, options.cwd);
+    // On a POSIX host the gate starts exactly verificationCommandInvocation's
+    // program, argv and environment: the run contract that
+    // verification_reuse_exec_evidence compares describes what runs here.
+    const invocation = hostShell.kind === "posix" && shell.kind === "posix"
+      ? invocationForAuthoredCommand(authoredCommand, options.cwd, childEnv, hostShell)
+      : null;
     const outputDir = mkdtempSync(join(tmpdir(), "gsd-verification-"));
     // Git Bash runs authored Verify text from a temp script file so the
     // selected absolute bash.exe executes the command as a script file in its
     // own process, without re-resolving bash by name or re-parsing via eval.
-    const shellArgs = shell.kind === "git-bash"
+    const shellArgs = invocation
+      ? invocation.args
+      : shell.kind === "git-bash"
       ? (() => {
           const commandPath = join(outputDir, "verify.sh");
           writeFileSync(commandPath, `set -o pipefail\n${rewrittenCommand}\n`, "utf-8");
@@ -1613,9 +1785,9 @@ export async function runVerificationGate(options: RunVerificationGateOptions): 
     let stdout: string;
     let capturedStderr: string;
     try {
-      result = await spawnVerificationCommand(shell.bin, shellArgs, {
+      result = await spawnVerificationCommand(invocation?.bin ?? shell.bin, shellArgs, {
         cwd: options.cwd,
-        env: childEnv,
+        env: invocation?.env ?? childEnv,
         stdio: ["ignore", stdoutFd, stderrFd],
         timeout: options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
         // cmd re-parses its command line itself; Node's quoting would mangle

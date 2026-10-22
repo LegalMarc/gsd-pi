@@ -46,6 +46,13 @@ export interface ExecSandboxOptions {
   env_allowlist: readonly string[];
   /** Optional override of process.env for tests. */
   env?: NodeJS.ProcessEnv;
+  /**
+   * Start this exact program, argv and environment instead of the runtime's
+   * interpreter with the allowlisted environment: the host verification gate's
+   * own invocation of a Verify command (verification_reuse_exec_evidence).
+   * The script is not appended; `args` already carries the command.
+   */
+  invocation?: { cmd: string; args: readonly string[]; env: NodeJS.ProcessEnv };
   /** Optional override for the current time (tests). */
   now?: () => Date;
   /** Optional override for id generation (tests). */
@@ -200,15 +207,17 @@ export function runExecSandbox(
     const metaPath = resolve(execDir, `${id}.meta.json`);
 
     const timeoutMs = clampTimeout(request, opts);
-    const { cmd, args } = resolveCommand(request.runtime);
+    const { cmd, args } = opts.invocation
+      ? { cmd: opts.invocation.cmd, args: [...opts.invocation.args] }
+      : resolveCommand(request.runtime);
     const script = request.runtime === "bash" ? sanitizeBashScriptForWindows(request.script) : request.script;
-    const env = buildChildEnv(opts);
+    const env = opts.invocation ? { ...opts.invocation.env } : buildChildEnv(opts);
     const useProcessGroup = process.platform !== "win32";
 
     const started = Date.now();
     let child;
     try {
-      child = spawn(cmd, [...args, script], {
+      child = spawn(cmd, opts.invocation ? args : [...args, script], {
         cwd: opts.baseDir,
         env,
         stdio: ["ignore", "pipe", "pipe"],

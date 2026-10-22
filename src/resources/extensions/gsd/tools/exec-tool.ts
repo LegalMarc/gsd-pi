@@ -17,10 +17,12 @@ import {
 } from "../preferences-types.js";
 import { bashReferencesProjectRootOutsideWorktree } from "../worktree-shell-guard.js";
 import { openExistingWorkflowDatabase } from "../db-workspace.js";
-import { currentExecAttemptRef, recordExecRun } from "../db/writers/exec-runs.js";
+import { currentExecAttemptRef, currentExecTask, recordExecRun } from "../db/writers/exec-runs.js";
+import { getTask } from "../db/queries.js";
 import { loadEffectiveGSDPreferences } from "../preferences.js";
 import { redactSecrets } from "../redact-secrets.js";
 import { readSourceRevisionForRecord } from "../verification-source-integrity.js";
+import { discoverCommands, verificationCommandInvocation, type VerificationCommandInvocation } from "../verification-gate.js";
 import { contextModeDisabledResult, type ToolExecutionResult } from "./context-mode-tool-result.js";
 
 export interface ExecToolParams {
@@ -44,6 +46,15 @@ export interface ExecToolDeps {
   generateId?: () => string;
   signal?: AbortSignal;
   /**
+   * True only where gsd_exec runs in the same process as host verification
+   * (the in-process tool). With verification_reuse_exec_evidence, a run of the
+   * Task's own Verify command is then started with the gate's invocation so the
+   * gate can reuse it. Elsewhere (the workflow MCP server, another process with
+   * another environment) such a run could never match the gate's contract, so
+   * it stays an ordinary sandboxed run.
+   */
+  gateHost?: boolean;
+  /**
    * Runs the host-record steps: reading the caller's Attempt before the
    * command, and writing the run after it. The workflow MCP server passes its
    * operation queue here, so only those short DB steps are serialized with
@@ -53,7 +64,10 @@ export interface ExecToolDeps {
   serializeRecord?: <T>(fn: () => Promise<T>) => Promise<T>;
 }
 
-type ExecToolPreferences = Pick<GSDPreferences, "context_mode" | "verification_timeout_ms">;
+type ExecToolPreferences = Pick<
+  GSDPreferences,
+  "context_mode" | "verification_timeout_ms" | "verification_reuse_exec_evidence"
+>;
 
 const UNRELATED_EXEC_DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -279,6 +293,7 @@ function recordRun(
   startedAt: Date,
   uat: UatExecBinding | undefined,
   attemptRefAtStart: string | null | undefined,
+  gateRun: GateRunRecord | null = null,
 ): string | null {
   try {
     const opened = openExistingWorkflowDatabase(baseDir);
@@ -287,7 +302,7 @@ function recordRun(
       return opened.error?.message ?? `workflow database ${opened.reason}`;
     }
     // A database that appeared during the command had no Attempt to read at its start.
-    storeRun(baseDir, result, script, startedAt, uat, attemptRefAtStart === undefined ? null : attemptRefAtStart);
+    storeRun(baseDir, result, script, startedAt, uat, attemptRefAtStart === undefined ? null : attemptRefAtStart, gateRun);
     return null;
   } catch (err) {
     return err instanceof Error ? err.message : String(err);
@@ -301,6 +316,7 @@ function storeRun(
   startedAt: Date,
   uat: UatExecBinding | undefined,
   attemptRefAtStart: string | null,
+  gateRun: GateRunRecord | null,
 ): void {
   const hash = createHash("sha256");
   for (const path of [result.stdout_path, result.stderr_path]) hash.update(readFileSync(path));
@@ -324,8 +340,38 @@ function storeRun(
           ...uat,
           sourceRevision: readSourceRevisionForRecord(baseDir, loadEffectiveGSDPreferences(baseDir)?.preferences),
         }
-      : { kind: "exec" }),
+      : { kind: "exec", sourceRevision: gateRun?.sourceRevision ?? null, runContract: gateRun?.contract ?? null }),
   });
+}
+
+/** What a run started with the gate's own invocation stores for reuse. */
+interface GateRunRecord {
+  contract: string;
+  /** The verification source revision, read before and after the command; null unless both agree. */
+  sourceRevision: string | null;
+}
+
+/**
+ * verification_reuse_exec_evidence: when `script` is one of the runnable
+ * commands of the Verify field of the Task whose Attempt this run belongs to,
+ * the host gate's own invocation of it (program, argv, environment), so the
+ * gate can later take this run in place of running the command again.
+ * Otherwise null and the run is an ordinary sandboxed gsd_exec run.
+ *
+ * The invocation carries the gate's environment (GSD's own, less its worker
+ * lock variables), not the sandbox allowlist. It is used only for a command
+ * the gate itself runs, with that environment, for this Task.
+ */
+function gateInvocationForTaskVerify(baseDir: string, script: string): VerificationCommandInvocation | null {
+  const opened = openExistingWorkflowDatabase(baseDir);
+  if (!opened.ok) return null;
+  const task = currentExecTask(baseDir);
+  if (!task) return null;
+  const verify = getTask(task.milestoneId, task.sliceId, task.taskId)?.verify;
+  const command = script.trim();
+  const { commands, source } = discoverCommands({ taskPlanVerify: verify, cwd: baseDir });
+  if (source !== "task-plan" || !commands.includes(command)) return null;
+  return verificationCommandInvocation(command, baseDir);
 }
 
 export async function executeGsdExec(
@@ -348,12 +394,6 @@ export async function executeGsdExec(
     );
   }
 
-  const opts = buildExecOptions(
-    deps.baseDir,
-    deps.preferences,
-    { env: deps.env, now: deps.now, generateId: deps.generateId, signal: deps.signal },
-    isVerificationWorkload(params, script),
-  );
   const run = deps.run ?? runExecSandbox;
   const serialize = <T>(fn: () => Promise<T>): Promise<T> => (deps.serializeRecord ? deps.serializeRecord(fn) : fn());
 
@@ -363,6 +403,31 @@ export async function executeGsdExec(
   } catch {
     attemptRefAtStart = null;
   }
+
+  let gateInvocation: VerificationCommandInvocation | null = null;
+  if (!uat && deps.gateHost === true && runtime === "bash" && deps.preferences?.verification_reuse_exec_evidence === true) {
+    try {
+      gateInvocation = await serialize(async () => gateInvocationForTaskVerify(deps.baseDir, script));
+    } catch {
+      gateInvocation = null;
+    }
+  }
+  // A Verify-command run is a verification workload whatever its purpose label.
+  const opts = buildExecOptions(
+    deps.baseDir,
+    deps.preferences,
+    { env: deps.env, now: deps.now, generateId: deps.generateId, signal: deps.signal },
+    gateInvocation !== null || isVerificationWorkload(params, script),
+  );
+  const runOpts: ExecSandboxOptions = gateInvocation
+    ? { ...opts, invocation: { cmd: gateInvocation.bin, args: gateInvocation.args, env: gateInvocation.env } }
+    : opts;
+  // The tree is read before and after a gate-invocation run, and the run
+  // carries a revision only when the two agree: an edit during the command
+  // never becomes tested-source evidence. Reading hashes the source, so only
+  // these runs pay for it.
+  const readRevision = () => readSourceRevisionForRecord(deps.baseDir, loadEffectiveGSDPreferences(deps.baseDir)?.preferences);
+  const sourceBefore = gateInvocation ? readRevision() : null;
 
   const startedAt = (deps.now ?? (() => new Date()))();
   let result: ExecSandboxResult;
@@ -375,7 +440,7 @@ export async function executeGsdExec(
         ...(params.metadata && typeof params.metadata === "object" ? { metadata: params.metadata } : {}),
         ...(typeof params.timeout_ms === "number" ? { timeout_ms: params.timeout_ms } : {}),
       },
-      opts,
+      runOpts,
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -385,11 +450,26 @@ export async function executeGsdExec(
       isError: true,
     };
   }
-  const formatted = formatResult(result, typeof params.purpose === "string" ? params.purpose : undefined);
+  const succeeded = result.exit_code === 0 && result.signal === null && !result.timed_out && result.aborted !== true;
+  const sourceAfter = sourceBefore !== null && succeeded ? readRevision() : null;
+  const gateRun: GateRunRecord | null = gateInvocation
+    ? { contract: gateInvocation.contract, sourceRevision: sourceBefore !== null && sourceBefore === sourceAfter ? sourceBefore : null }
+    : null;
+  const plain = formatResult(result, typeof params.purpose === "string" ? params.purpose : undefined);
+  const formatted: ToolExecutionResult = gateInvocation
+    ? {
+      ...plain,
+      content: [{
+        type: "text",
+        text: `${plain.content[0]!.text}\n--- note ---\nRan as host verification runs this Task's Verify command (its shell and environment), so the gate can reuse this run.`,
+      }],
+      details: { ...plain.details, verification_gate_invocation: true },
+    }
+    : plain;
   let notRecorded: string | null;
   let recordUnknown = false;
   try {
-    notRecorded = await serialize(async () => recordRun(deps.baseDir, result, script, startedAt, uat, attemptRefAtStart));
+    notRecorded = await serialize(async () => recordRun(deps.baseDir, result, script, startedAt, uat, attemptRefAtStart, gateRun));
   } catch (err) {
     // The command ran: a failed record step is reported as a warning, never as
     // a failed run. recordRun reports its own errors, so this is the queue

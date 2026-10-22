@@ -706,3 +706,23 @@ test('runExecSandbox: zero digest budget disables the excerpt along with the pre
   assert.equal(result.exit_code, 1);
   assert.equal(result.stderr_excerpt, undefined, 'excerpt disabled with the digest budget');
 });
+
+test('runExecSandbox: an invocation starts that exact program, argv and environment instead of the allowlisted runtime', async (t) => {
+  if (process.platform === 'win32') return t.skip('POSIX shell only');
+  const base = freshBase();
+  t.after(() => cleanup(base));
+  const result = await runExecSandbox(
+    { runtime: 'bash', script: 'false | true' },
+    baseOpts(base, {
+      env_allowlist: [],
+      env: { PATH: '/usr/bin:/bin', HOME: '/tmp' },
+      invocation: {
+        cmd: 'bash',
+        args: ['-o', 'pipefail', '-c', 'echo GATE=$GSD_TEST_GATE_ONLY; false | true'],
+        env: { PATH: process.env.PATH ?? '/usr/bin:/bin', GSD_TEST_GATE_ONLY: 'gate-value' },
+      },
+    }),
+  );
+  assert.equal(result.exit_code, 1, 'the invocation argv ran (pipefail), not the request script under plain bash');
+  assert.match(readFileSync(result.stdout_path, 'utf-8'), /GATE=gate-value/, 'the invocation environment reached the child');
+});

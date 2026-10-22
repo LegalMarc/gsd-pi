@@ -22,7 +22,7 @@ import { join, dirname, delimiter } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { discoverCommands, runVerificationGate, runVerificationGateForTargets, formatFailureContext, captureRuntimeErrors, runDependencyAudit, isLikelyCommand, validateVerificationCommand, assertVerifyIsShellCheckable, splitUnquotedLines, verificationChildEnvironment, resolveGitPosixToolsDirectory, resolveGitBashExecutable, resolveVerificationShell, looksLikeCmdCommand, looksLikePosixAuthoredCommand, shellForCommand, normalizeCommandIdentity, hostRecordedTaskEvidence } from "../verification-gate.ts";
+import { discoverCommands, runVerificationGate, runVerificationGateForTargets, formatFailureContext, captureRuntimeErrors, runDependencyAudit, isLikelyCommand, validateVerificationCommand, assertVerifyIsShellCheckable, splitUnquotedLines, verificationChildEnvironment, resolveGitPosixToolsDirectory, resolveGitBashExecutable, resolveVerificationShell, looksLikeCmdCommand, looksLikePosixAuthoredCommand, shellForCommand, normalizeCommandIdentity, hostRecordedTaskEvidence, verificationCommandInvocation, verificationRunContract, decideVerificationReuse, type ReusableExecRun } from "../verification-gate.ts";
 import { prependPathEntry } from "../../shared/rtk-shared.ts";
 import type { CaptureRuntimeErrorsOptions, DependencyAuditOptions } from "../verification-gate.ts";
 import { validatePreferences } from "../preferences.ts";
@@ -2618,3 +2618,103 @@ describe("verification-gate: python normalization (#4416)", () => {
     assert.ok(result.checks[0].durationMs >= 0);
   });
 });
+
+describe("verification run contract (verification_reuse_exec_evidence)", () => {
+  test("the invocation is the gate's own: sh running bash -o pipefail on the command, so `false | true` fails as in the gate", (t) => {
+    if (process.platform === "win32") return t.skip("POSIX shell only");
+    const dir = mkdtempDir();
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const invocation = verificationCommandInvocation("false | true", dir);
+    assert.ok(invocation, "a POSIX host has a contract");
+    assert.equal(invocation!.bin, "sh");
+    assert.ok(invocation!.args.some((arg) => arg.includes("bash -o pipefail -c")));
+    assert.equal(invocation!.args.at(-1), "false | true");
+    const viaGate = spawnSync(invocation!.bin, invocation!.args, { cwd: dir, env: invocation!.env });
+    assert.notEqual(viaGate.status, 0, "pipefail fails the pipeline");
+    const viaPlainBash = spawnSync("bash", ["-c", "false | true"], { cwd: dir });
+    assert.equal(viaPlainBash.status, 0, "plain bash -c would pass it");
+  });
+
+  test("the contract changes with the command, the folder, any environment variable, and the program or argv", (t) => {
+    if (process.platform === "win32") return t.skip("POSIX shell only");
+    const dir = mkdtempDir();
+    const other = mkdtempDir();
+    t.after(() => {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(other, { recursive: true, force: true });
+    });
+    const env = { PATH: process.env.PATH ?? "", HOME: "/home/test" };
+    const base = verificationCommandInvocation("npm test", dir, env)!.contract;
+    assert.equal(verificationCommandInvocation("npm test", dir, { ...env })!.contract, base, "same inputs, same contract");
+    assert.notEqual(verificationCommandInvocation("npm  test", dir, env)!.contract, base);
+    assert.notEqual(verificationCommandInvocation("npm test", other, env)!.contract, base);
+    assert.notEqual(verificationCommandInvocation("npm test", dir, { ...env, CI: "1" })!.contract, base);
+    assert.notEqual(verificationCommandInvocation("npm test", dir, { ...env, HOME: "/home/other" })!.contract, base);
+    assert.notEqual(verificationRunContract("bash", ["-c", "npm test"], dir, env), base);
+  });
+});
+
+describe("decideVerificationReuse", () => {
+  const REV = "sha256:" + "a".repeat(64);
+  const run = (over: Partial<ReusableExecRun> = {}): ReusableExecRun => ({
+    id: "run-1",
+    runContract: "contract:npm test",
+    sourceRevision: REV,
+    succeeded: true,
+    startedAt: "2026-10-22T10:00:00.000Z",
+    durationMs: 5_000,
+    outputHash: "sha256:" + "b".repeat(64),
+    ...over,
+  });
+  const contractFor = (command: string) => `contract:${command}`;
+
+  test("every command's newest run with the gate's contract, green, on the tested revision and under the limit, is reused with its provenance", () => {
+    const decision = decideVerificationReuse(
+      ["npm test", "npm run lint"],
+      contractFor,
+      REV,
+      60_000,
+      [run(), run({ id: "run-2", runContract: "contract:npm run lint", durationMs: 1_000 })],
+    );
+    assert.equal(decision.reused, true);
+    assert.deepEqual(decision.reused && decision.checks.map((check) => [check.command, check.exitCode, check.reusedExecRun?.id]), [
+      ["npm test", 0, "run-1"],
+      ["npm run lint", 0, "run-2"],
+    ]);
+    assert.equal(decision.reused && decision.checks[0]!.reusedExecRun?.startedAt, "2026-10-22T10:00:00.000Z");
+  });
+
+  const misses: Array<[string, Parameters<typeof decideVerificationReuse>]> = [
+    ["no commands", [[], contractFor, REV, 60_000, [run()]]],
+    ["unknown tested revision", [["npm test"], contractFor, "unavailable", 60_000, [run()]]],
+    ["no contract on this host", [["npm test"], () => null, REV, 60_000, [run()]]],
+    ["no run with the gate's contract", [["npm test"], contractFor, REV, 60_000, [run({ runContract: "contract:other" })]]],
+    ["a run with no contract", [["npm test"], contractFor, REV, 60_000, [run({ runContract: null })]]],
+    ["a failed run", [["npm test"], contractFor, REV, 60_000, [run({ succeeded: false })]]],
+    ["another revision", [["npm test"], contractFor, REV, 60_000, [run({ sourceRevision: "sha256:" + "c".repeat(64) })]]],
+    ["an unknown run revision", [["npm test"], contractFor, REV, 60_000, [run({ sourceRevision: null })]]],
+    ["a run as long as the limit", [["npm test"], contractFor, REV, 5_000, [run()]]],
+    ["one command of two without a run", [["npm test", "npm run lint"], contractFor, REV, 60_000, [run()]]],
+    ["a newer failed run over an older green one", [["npm test"], contractFor, REV, 60_000, [
+      run(),
+      run({ id: "run-9", startedAt: "2026-10-22T10:05:00.000Z", succeeded: false }),
+    ]]],
+    ["a newer run on an unknown revision over an older green one", [["npm test"], contractFor, REV, 60_000, [
+      run({ id: "run-9", startedAt: "2026-10-22T10:05:00.000Z", sourceRevision: null }),
+      run(),
+    ]]],
+  ];
+  for (const [name, args] of misses) {
+    test(`runs the gate: ${name}`, () => {
+      const decision = decideVerificationReuse(...args);
+      assert.equal(decision.reused, false);
+      assert.equal(typeof (decision as { reason: string }).reason, "string");
+    });
+  }
+});
+
+function mkdtempDir(): string {
+  const dir = join(tmpdir(), `gsd-run-contract-${process.pid}-${Math.random().toString(36).slice(2)}`);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}

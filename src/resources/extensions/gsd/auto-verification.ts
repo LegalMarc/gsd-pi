@@ -39,6 +39,7 @@ import {
   runDependencyAudit,
   hasQualifyingTaskEvidence,
   hostRecordedTaskEvidence,
+  reuseRecordedVerification,
 } from "./verification-gate.js";
 import type { VerificationTarget, TaskVerificationEvidence } from "./verification-gate.js";
 import { evidenceChecks, writeVerificationJSON, type PostExecutionCheckJSON, type EvidenceJSON } from "./verification-evidence.js";
@@ -206,9 +207,16 @@ function recordHostTechnicalVerdict(input: {
   if (!isTaskAttemptAwaitingVerification(input.attempt)) {
     throw new Error("Host verification requires the latest succeeded canonical Attempt at the verify stage");
   }
-  const startedAtMs = Number.isFinite(input.result.timestamp) ? input.result.timestamp : Date.now();
+  // A reused check (verification_reuse_exec_evidence) was not run by the gate:
+  // its window is the recorded run's own start and duration.
+  const reusedRuns = input.result.checks.flatMap((check) => (check.reusedExecRun ? [check.reusedExecRun] : []));
+  const startedAtMs = reusedRuns.length > 0
+    ? Math.min(...reusedRuns.map((run) => Date.parse(run.startedAt)))
+    : Number.isFinite(input.result.timestamp) ? input.result.timestamp : Date.now();
   const durationMs = input.result.checks.reduce((total, check) => total + Math.max(0, check.durationMs), 0);
-  const endedAtMs = startedAtMs + durationMs;
+  const endedAtMs = reusedRuns.length > 0
+    ? Math.max(...reusedRuns.map((run) => Date.parse(run.startedAt) + Math.max(0, run.durationMs)))
+    : startedAtMs + durationMs;
   const commands = input.result.checks.map((check) => check.command).filter(Boolean);
   const targetSourceRevisions = Object.fromEntries(
     (input.sourceBefore?.targets ?? []).map((target) => [target.targetId, target.revision]),
@@ -238,6 +246,9 @@ function recordHostTechnicalVerdict(input: {
         targetSourceRevisions,
         sourceRevisionAfter: input.sourceAfter?.aggregateRevision ?? "unavailable",
         sourceIntegrity: input.sourceError ?? "stable",
+        ...(reusedRuns.length > 0
+          ? { reusedExecRuns: reusedRuns.map((run) => ({ ...run })) as unknown as DomainJsonValue[] }
+          : {}),
         ...(input.result.checks.some((check) => check.failureClass === "timeout")
           ? { failureClass: "timeout" }
           : {}),
@@ -958,13 +969,44 @@ export async function runPostUnitVerification(
         timestamp: Date.now(),
       };
     } else if (verificationTargets.length <= 1) {
-      result = await (vctx.runVerificationGate ?? runVerificationGate)({
+      const gateOptions = {
         cwd: verificationTargets[0]?.cwd ?? s.basePath,
         preferenceCommands: prefs?.verification_commands ?? verificationTargets[0]?.preferenceCommands,
         taskPlanVerify,
         taskEvidence,
         commandTimeoutMs: resolveVerificationTimeoutMs(prefs),
-      });
+      };
+      // Opt-in: a gsd_exec run of a discovered command stands in for running
+      // it again only when it was started with the gate's own run contract
+      // (program, argv, folder, whole environment) on exactly this source
+      // revision, succeeded, and took less than the gate's limit. Anything
+      // less runs the gate. Runtime errors, the dependency audit, the
+      // source-after snapshot and the verdict below are unchanged.
+      let reused: VerificationGateResult | null = null;
+      if (prefs?.verification_reuse_exec_evidence === true) {
+        const reuse = reuseRecordedVerification({
+          ...gateOptions,
+          sourceRevision: sourceBeforeResult.snapshot.aggregateRevision,
+          runs: listExecRunsOfAttempt(latestAttempt.attemptId)
+            .filter((run) => run.kind === "exec")
+            .map((run) => ({
+              id: run.id,
+              runContract: run.run_contract,
+              sourceRevision: run.source_revision,
+              succeeded: execRunSucceeded(run),
+              startedAt: run.started_at,
+              durationMs: run.duration_ms,
+              outputHash: run.output_hash,
+            })),
+        });
+        reused = reuse.result;
+        process.stderr.write(
+          reuse.result
+            ? `verification-gate: reused gsd_exec run(s) ${reuse.result.checks.map((check) => check.reusedExecRun?.id).join(", ")}\n`
+            : `verification-gate: running the gate (no reuse: ${reuse.reason})\n`,
+        );
+      }
+      result = reused ?? await (vctx.runVerificationGate ?? runVerificationGate)(gateOptions);
     } else {
       result = await runVerificationGateForTargets({
         targets: verificationTargets,

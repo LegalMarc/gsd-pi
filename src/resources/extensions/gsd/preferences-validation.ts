@@ -1477,6 +1477,14 @@ export function validatePreferences(preferences: GSDPreferences): {
     }
   }
 
+  if (preferences.verification_reuse_exec_evidence !== undefined) {
+    if (typeof preferences.verification_reuse_exec_evidence === "boolean") {
+      validated.verification_reuse_exec_evidence = preferences.verification_reuse_exec_evidence;
+    } else {
+      errors.push("verification_reuse_exec_evidence must be a boolean");
+    }
+  }
+
   if (preferences.verification_timeout_ms !== undefined) {
     const raw = preferences.verification_timeout_ms;
     if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {

@@ -215,6 +215,18 @@ describe("UAT runs are bound to the source revision", () => {
     assert.equal(readExecRun(await uatExec("S01", "printf ok"))?.source_revision, currentSourceRevision());
   });
 
+  test("a database created before the run contract column gets the column on open, and gsd_exec runs are still recorded", async () => {
+    _getAdapter()!.exec("ALTER TABLE exec_runs DROP COLUMN run_contract");
+    closeDatabase();
+    openDatabase(join(base, ".gsd", "gsd.db"));
+
+    const result = await executeGsdExec({ script: "printf ok" }, { baseDir: base, preferences: null });
+    assert.equal(result.details?.run_not_recorded, undefined, String(result.details?.run_not_recorded));
+    const run = readExecRun(String(result.details?.id));
+    assert.equal(run?.exit_code, 0);
+    assert.equal(run?.run_contract, null);
+  });
+
   test("the prepared UAT result carries the source revision it was saved for", async () => {
     commitSource("one\n");
     const id = await uatExec("S01", "printf ok");

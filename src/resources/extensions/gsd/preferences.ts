@@ -968,6 +968,7 @@ function mergePreferences(base: GSDPreferences, override: GSDPreferences): GSDPr
     verification_auto_fix: override.verification_auto_fix ?? base.verification_auto_fix,
     verification_max_retries: override.verification_max_retries ?? base.verification_max_retries,
     verification_timeout_ms: override.verification_timeout_ms ?? base.verification_timeout_ms,
+    verification_reuse_exec_evidence: override.verification_reuse_exec_evidence ?? base.verification_reuse_exec_evidence,
     verification_source_exclude_paths: mergeStringLists(
       base.verification_source_exclude_paths,
       override.verification_source_exclude_paths,
